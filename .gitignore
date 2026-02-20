@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+backend/node_modules/
+
+# environment
+.env
+backend/.env
+
+# uploads/temp files
+backend/uploads/
+*.log
+
+# OS files
+.DS_Store
