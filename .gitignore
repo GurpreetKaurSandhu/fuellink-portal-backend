@@ -8,6 +8,7 @@ backend/.env
 
 # uploads/temp files
 backend/uploads/
+backend/uploads/rates/
 *.log
 
 # OS files

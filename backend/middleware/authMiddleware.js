@@ -1,5 +1,9 @@
 const jwt = require("jsonwebtoken");
 
+if (!process.env.JWT_SECRET) {
+  throw new Error("JWT_SECRET is not set");
+}
+
 module.exports = function (req, res, next) {
   const authHeader = req.header("Authorization");
 
@@ -10,7 +14,7 @@ module.exports = function (req, res, next) {
   try {
     const token = authHeader.split(" ")[1];
 
-    const verified = jwt.verify(token, "fuellink_secret_key");
+    const verified = jwt.verify(token, process.env.JWT_SECRET);
 
     req.user = verified;
 

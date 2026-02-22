@@ -4,6 +4,10 @@ const pool = require("../db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
+if (!process.env.JWT_SECRET) {
+  throw new Error("JWT_SECRET is not set");
+}
+
 router.post("/register", async (req, res) => {
   try {
     const { name, email, password } = req.body;
@@ -56,7 +60,7 @@ router.post("/login", async (req, res) => {
         role: user.rows[0].role,
         customer_id: user.rows[0].customer_id,
       },
-      "fuellink_secret_key",
+      process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
 

@@ -1,3 +1,6 @@
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
+
 const adminRoutes = require("./routes/admin");
 console.log("🔥 CLEAN SERVER VERSION 🔥");
 
@@ -6,7 +9,9 @@ const cors = require("cors");
 const pool = require("./db");
 const authRoutes = require("./routes/auth");
 const cardsRoutes = require("./routes/cards");
+const ratesRoutes = require("./routes/rates");
 const authMiddleware = require("./middleware/authMiddleware");
+const { recalculateTransactions } = require("./services/recalculateTransactions");
 
 const app = express();
 
@@ -15,6 +20,7 @@ app.use(express.json());
 app.use("/api/admin", adminRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/cards", cardsRoutes);
+app.use("/api/rates", ratesRoutes);
 
 app.get("/", async (req, res) => {
   const result = await pool.query("SELECT NOW()");
@@ -151,10 +157,103 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
   }
 });
 
+app.post("/api/transactions/recalculate", authMiddleware, async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== "admin") {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    const { date_from, date_to, customer_id } = req.body || {};
+    if (!date_from || !date_to) {
+      return res.status(400).json({ message: "date_from and date_to are required" });
+    }
+
+    let customerIdNum = null;
+    if (customer_id != null) {
+      const parsed = parseInt(customer_id, 10);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return res.status(400).json({ message: "Invalid customer_id" });
+      }
+      customerIdNum = parsed;
+    }
+
+    const result = await recalculateTransactions({
+      date_from,
+      date_to,
+      customer_id: customerIdNum,
+    });
+
+    res.json({
+      message: "Recalculation complete",
+      ...result,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: err.message || "Server error" });
+  }
+});
+
+app.get("/api/invoices/preview", authMiddleware, async (req, res) => {
+  try {
+    const { date_from, date_to, customer_id } = req.query;
+
+    if (!date_from || !date_to) {
+      return res.status(400).json({ message: "date_from and date_to are required" });
+    }
+
+    const isAdmin = req.user && req.user.role === "admin";
+    const values = [date_from, date_to];
+    let where = "WHERE purchase_datetime >= $1 AND purchase_datetime <= $2";
+
+    if (isAdmin) {
+      if (customer_id) {
+        const parsed = parseInt(customer_id, 10);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          return res.status(400).json({ message: "Invalid customer_id" });
+        }
+        values.push(parsed);
+        where += ` AND customer_id = $${values.length}`;
+      }
+    } else {
+      values.push(req.user.customer_id);
+      where += ` AND customer_id = $${values.length}`;
+    }
+
+    const sql = `
+      SELECT
+        customer_id,
+        COUNT(*)::int AS transaction_count,
+        COALESCE(SUM(volume_liters), 0) AS total_litres,
+        COALESCE(SUM(subtotal), 0) AS subtotal,
+        COALESCE(SUM(gst), 0) AS gst,
+        COALESCE(SUM(pst), 0) AS pst,
+        COALESCE(SUM(qst), 0) AS qst,
+        COALESCE(SUM(total), 0) AS total
+      FROM transactions
+      ${where}
+      GROUP BY customer_id
+      ORDER BY customer_id ASC
+    `;
+
+    const result = await pool.query(sql, values);
+
+    res.json({
+      date_from,
+      date_to,
+      data: result.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 app.get("/test", (req, res) => {
   res.send("Test route working");
 });
 
-app.listen(8000, () => {
-  console.log("Server running on port 8000");
+const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8000;
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
