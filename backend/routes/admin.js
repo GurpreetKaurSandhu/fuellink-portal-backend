@@ -8,6 +8,8 @@ const XLSX = require("xlsx");
 const pool = require("../db");  // ← ADD THIS
 const authMiddleware = require("../middleware/authMiddleware");
 const { recalculateTransactions } = require("../services/recalculateTransactions");
+const bcrypt = require("bcrypt");
+const crypto = require("crypto");
 
 const upload = multer({
   dest: path.join(__dirname, "../uploads"),
@@ -58,6 +60,12 @@ const parseDateTime = (value) => {
   return Number.isNaN(d.getTime()) ? null : d;
 };
 
+const formatDateOnly = (value) => {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+};
+
 const round4 = (value) => {
   if (value == null || !Number.isFinite(value)) return null;
   return Math.round(value * 10000) / 10000;
@@ -81,6 +89,8 @@ const requireAdmin = (req, res) => {
   }
   return true;
 };
+
+const generateTempPassword = () => crypto.randomBytes(6).toString("hex");
 
 const resolveCustomerId = async (customer_id, customer_number) => {
   const customerNumber = String(customer_number || "").trim();
@@ -113,10 +123,89 @@ const parseSheetRows = (filePath) => {
 };
 
 const customerColumns = `
-  id, customer_number, company_name, owner_name, city, email, bv, fuellink_card, otp_setup,
-  deposit, address, security_deposit_invoice, customer_status, reference_name, comment,
-  rate_group_id, created_at
+  id,
+  customer_number,
+  company_name,
+  owner_name,
+  city,
+  email,
+  contact_email,
+  phone,
+  address,
+  fuellink_card,
+  otp_setup,
+  deposit,
+  security_deposit_invoice,
+  customer_status,
+  reference_name,
+  comment,
+  rate_group_id,
+  created_at
 `;
+
+const parsePdfTransactionLines = (text) => {
+  const lines = String(text || "").split(/\r?\n/);
+  const parsed = [];
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "").trim();
+    if (!/^\d{4,}/.test(line)) continue;
+
+    const tokens = line.split(/\s+/).filter(Boolean);
+    if (tokens.length < 7) continue;
+
+    const card_number = tokens[0];
+    const dateIdx = tokens.findIndex((token, idx) => idx > 0 && (
+      /^\d{4}[/-]\d{2}[/-]\d{2}$/.test(token) ||
+      /^\d{2}[/-]\d{2}[/-]\d{4}$/.test(token)
+    ));
+    if (dateIdx < 0 || dateIdx + 3 >= tokens.length) continue;
+
+    const timeToken = tokens[dateIdx + 1];
+    if (!/^\d{2}:\d{2}(:\d{2})?$/.test(timeToken)) continue;
+
+    const driver_name = tokens.slice(1, dateIdx).join(" ").trim() || null;
+    const dateToken = tokens[dateIdx].replace(/\//g, "-");
+    const purchase_datetime = parseDateTime(`${dateToken} ${timeToken}`);
+    if (!purchase_datetime) continue;
+
+    const product = tokens[dateIdx + 2] || null;
+    const volume_liters = parseNumber(tokens[dateIdx + 3]);
+    if (!Number.isFinite(volume_liters)) continue;
+
+    const amountToken = tokens[dateIdx + 4];
+    const amount = parseNumber(amountToken);
+    const document_number = tokens[dateIdx + 5] || null;
+    const location = tokens.slice(dateIdx + 6).join(" ").trim() || null;
+
+    const numericExtras = tokens
+      .map((token) => parseNumber(token))
+      .filter((value) => Number.isFinite(value));
+
+    parsed.push({
+      card_number,
+      driver_name,
+      purchase_datetime,
+      location,
+      city: null,
+      province: extractProvince(location),
+      document_number,
+      product,
+      volume_liters,
+      amount: Number.isFinite(amount) ? amount : null,
+      source_raw_json: {
+        amount: Number.isFinite(amount) ? amount : null,
+        numeric_tokens: numericExtras,
+        raw_line: line,
+      },
+    });
+  }
+
+  return parsed;
+};
+
+
+
 
 router.post(
   "/upload-transactions",
@@ -252,6 +341,171 @@ res.json({
         error: err.message
       });
     }
+  }
+);
+
+// Example:
+// curl -X POST http://localhost:8000/api/admin/transactions/upload-pdfs \
+//   -H "Authorization: Bearer <ADMIN_TOKEN>" \
+//   -F "files=@/path/one.pdf" -F "files=@/path/two.pdf"
+router.post(
+  "/transactions/upload-pdfs",
+  authMiddleware,
+  upload.array("files", 10),
+  async (req, res) => {
+    const files = Array.isArray(req.files) ? req.files : [];
+    if (!isAdmin(req.user)) {
+      files.forEach((file) => safeUnlink(file?.path));
+      return res.status(403).json({ message: "Access denied" });
+    }
+    if (files.length === 0) {
+      return res.status(400).json({ message: "No files received. Expected multipart field name: files" });
+    }
+
+    const summary = [];
+
+    for (const file of files) {
+      let uploadId = null;
+      const client = await pool.connect();
+      try {
+        const insertUpload = await client.query(
+          `INSERT INTO transaction_uploads
+           (uploaded_by_user_id, original_filename, stored_filename, source_type, parse_status)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id`,
+          [req.user.id || null, file.originalname || null, file.filename || null, "pdf", "processing"]
+        );
+        uploadId = insertUpload.rows[0].id;
+
+        const fileBuffer = fs.readFileSync(file.path);
+        const parsedPdf = await pdf(fileBuffer);
+        const rows = parsePdfTransactionLines(parsedPdf.text);
+
+        let inserted = 0;
+        let skipped = 0;
+        let unmatched = 0;
+
+        await client.query("BEGIN");
+
+        for (const row of rows) {
+          try {
+            const cardCustomer = await client.query(
+              "SELECT customer_id FROM cards WHERE card_number = $1 LIMIT 1",
+              [row.card_number]
+            );
+            const customerId = cardCustomer.rows[0]?.customer_id || null;
+            if (!customerId) {
+              unmatched += 1;
+            }
+
+            const amountKey = row.amount;
+            const dedupe = await client.query(
+              `SELECT id
+               FROM transactions
+               WHERE customer_id IS NOT DISTINCT FROM $1
+                 AND card_number = $2
+                 AND document_number IS NOT DISTINCT FROM $3
+                 AND purchase_datetime = $4
+                 AND volume_liters = $5
+                 AND COALESCE(
+                   CASE
+                     WHEN COALESCE(source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                     THEN (source_raw_json->>'amount')::numeric
+                     ELSE NULL
+                   END,
+                   total_amount
+                 ) IS NOT DISTINCT FROM $6
+               LIMIT 1`,
+              [customerId, row.card_number, row.document_number, row.purchase_datetime, row.volume_liters, amountKey]
+            );
+            if (dedupe.rows.length > 0) {
+              skipped += 1;
+              continue;
+            }
+
+            await client.query(
+              `INSERT INTO transactions
+               (customer_id, card_number, purchase_datetime, location, city, province, document_number, product,
+                volume_liters, total_amount, driver_name, source_upload_id, source_type, source_raw_json)
+               VALUES
+               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+              [
+                customerId,
+                row.card_number,
+                row.purchase_datetime,
+                row.location,
+                row.city,
+                row.province,
+                row.document_number,
+                row.product,
+                row.volume_liters,
+                row.amount,
+                row.driver_name,
+                uploadId,
+                "pdf",
+                row.source_raw_json,
+              ]
+            );
+            inserted += 1;
+          } catch (_rowErr) {
+            skipped += 1;
+          }
+        }
+
+        await client.query("COMMIT");
+
+        await client.query(
+          `UPDATE transaction_uploads
+           SET parse_status = 'done',
+               parse_error = NULL,
+               rows_inserted = $2,
+               rows_skipped = $3,
+               rows_unmatched = $4
+           WHERE id = $1`,
+          [uploadId, inserted, skipped, unmatched]
+        );
+
+        summary.push({
+          upload_id: uploadId,
+          original_filename: file.originalname,
+          rows_inserted: inserted,
+          rows_skipped: skipped,
+          rows_unmatched: unmatched,
+          parse_status: "done",
+        });
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_rollbackErr) {}
+
+        if (uploadId) {
+          try {
+            await client.query(
+              `UPDATE transaction_uploads
+               SET parse_status = 'failed',
+                   parse_error = $2
+               WHERE id = $1`,
+              [uploadId, String(err.message || "Unknown parse error")]
+            );
+          } catch (_updateErr) {}
+        }
+
+        summary.push({
+          upload_id: uploadId,
+          original_filename: file.originalname,
+          parse_status: "failed",
+          parse_error: String(err.message || "Unknown parse error"),
+        });
+      } finally {
+        client.release();
+        safeUnlink(file?.path);
+      }
+    }
+
+    return res.json({
+      message: "PDF upload processing complete",
+      files: summary,
+    });
   }
 );
 
@@ -626,7 +880,7 @@ router.post(
   }
 );
 
-router.post("/cards/import", authMiddleware, upload.single("file"), async (req, res) => {
+const handleCardsImport = async (req, res) => {
   try {
     if (!requireAdmin(req, res)) {
       safeUnlink(req.file?.path);
@@ -657,9 +911,12 @@ router.post("/cards/import", authMiddleware, upload.single("file"), async (req, 
     Object.keys(rows[0] || {}).forEach((key) => {
       const normalized = normalizeHeader(key);
       if (normalized === "cardnumber" || normalized === "card") headerMap.card_number = key;
-      if (normalized === "customernumber") headerMap.customer_number = key;
+      if (normalized === "customernumber" || normalized === "customer") headerMap.customer_number = key;
       if (normalized === "companyname") headerMap.company_name = key;
-      if (normalized === "drivername") headerMap.driver_name = key;
+      if (normalized === "changedate") headerMap.change_date = key;
+      if ((normalized === "drivername1" || normalized === "drivername") && !headerMap.driver_name) {
+        headerMap.driver_name = key;
+      }
       if (normalized === "status") headerMap.status = key;
       if (normalized === "pin" || normalized === "cardpin") headerMap.pin = key;
     });
@@ -693,6 +950,15 @@ router.post("/cards/import", authMiddleware, upload.single("file"), async (req, 
     try {
       await client.query("BEGIN");
 
+      const columnsResult = await client.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'cards'`
+      );
+      const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+      const canWriteChangeDate = columns.has("change_date") && Boolean(headerMap.change_date);
+
       for (let idx = 0; idx < rows.length; idx += 1) {
         const row = rows[idx] || {};
         try {
@@ -709,6 +975,7 @@ router.post("/cards/import", authMiddleware, upload.single("file"), async (req, 
             ? String(row[headerMap.driver_name] || "").trim() || null
             : null;
           const status = statusNorm(headerMap.status ? row[headerMap.status] : null);
+          const changeDate = canWriteChangeDate ? parseDateTime(row[headerMap.change_date]) : null;
 
           let customerId = defaultCustomerId;
           if (rowCustomerNumber) {
@@ -736,16 +1003,28 @@ router.post("/cards/import", authMiddleware, upload.single("file"), async (req, 
             throw new Error("Unable to resolve customer (customer_number/company_name/default customer)");
           }
 
-          const upsert = await client.query(
-            `INSERT INTO cards (customer_id, card_number, driver_name, status)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (card_number) DO UPDATE SET
-               customer_id = EXCLUDED.customer_id,
-               driver_name = EXCLUDED.driver_name,
-               status = EXCLUDED.status
-             RETURNING id, customer_id, card_number, driver_name, status, (xmax = 0) AS inserted`,
-            [customerId, cardNumber, driverName, status]
-          );
+          const upsert = canWriteChangeDate
+            ? await client.query(
+                `INSERT INTO cards (customer_id, card_number, driver_name, status, change_date)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (card_number) DO UPDATE SET
+                   customer_id = EXCLUDED.customer_id,
+                   driver_name = COALESCE(EXCLUDED.driver_name, cards.driver_name),
+                   status = EXCLUDED.status,
+                   change_date = COALESCE(EXCLUDED.change_date, cards.change_date)
+                 RETURNING id, customer_id, card_number, driver_name, status, (xmax = 0) AS inserted`,
+                [customerId, cardNumber, driverName, status, changeDate]
+              )
+            : await client.query(
+                `INSERT INTO cards (customer_id, card_number, driver_name, status)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (card_number) DO UPDATE SET
+                   customer_id = EXCLUDED.customer_id,
+                   driver_name = COALESCE(EXCLUDED.driver_name, cards.driver_name),
+                   status = EXCLUDED.status
+                 RETURNING id, customer_id, card_number, driver_name, status, (xmax = 0) AS inserted`,
+                [customerId, cardNumber, driverName, status]
+              );
 
           const card = upsert.rows[0];
           await client.query(
@@ -780,11 +1059,14 @@ router.post("/cards/import", authMiddleware, upload.single("file"), async (req, 
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Server error" });
+    return res.status(500).json({ message: err?.message || "Server error" });
   } finally {
     safeUnlink(req.file?.path);
   }
-});
+};
+
+router.post("/cards/import", authMiddleware, upload.single("file"), handleCardsImport);
+router.post("/cards/upload", authMiddleware, upload.single("file"), handleCardsImport);
 
 router.post("/pricing/import", authMiddleware, upload.single("file"), async (req, res) => {
   try {
@@ -1061,10 +1343,32 @@ router.get("/rate-groups", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
 
-    const result = await pool.query(
-      "SELECT id, name, markup_per_liter, created_at FROM rate_groups ORDER BY name ASC"
-    );
-    res.json(result.rows);
+    const [groupsResult, customersResult] = await Promise.all([
+      pool.query(
+        `SELECT
+           id,
+           name,
+           markup_per_liter,
+           markup_per_liter AS markup_per_litre,
+           created_at
+         FROM rate_groups
+         ORDER BY name ASC`
+      ),
+      pool.query(
+        `SELECT
+           id,
+           customer_number,
+           company_name,
+           rate_group_id
+         FROM customers
+         ORDER BY company_name ASC NULLS LAST, id ASC`
+      ),
+    ]);
+
+    res.json({
+      groups: groupsResult.rows,
+      customers: customersResult.rows,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });
@@ -1098,6 +1402,48 @@ router.post("/rate-groups", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.post("/rate-groups/assign", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const rateGroupId = parseInt(req.body?.rate_group_id, 10);
+    const customerIdsRaw = Array.isArray(req.body?.customer_ids) ? req.body.customer_ids : [];
+    const customerIds = Array.from(
+      new Set(
+        customerIdsRaw
+          .map((value) => parseInt(value, 10))
+          .filter((value) => Number.isInteger(value) && value > 0)
+      )
+    );
+
+    if (!Number.isInteger(rateGroupId) || rateGroupId < 1) {
+      return res.status(400).json({ message: "Invalid rate_group_id" });
+    }
+
+    if (customerIds.length === 0) {
+      return res.status(400).json({ message: "customer_ids must include at least one customer" });
+    }
+
+    const groupResult = await pool.query("SELECT id FROM rate_groups WHERE id = $1", [rateGroupId]);
+    if (groupResult.rows.length === 0) {
+      return res.status(400).json({ message: "rate_group_id does not exist" });
+    }
+
+    const updateResult = await pool.query(
+      "UPDATE customers SET rate_group_id = $1 WHERE id = ANY($2::int[])",
+      [rateGroupId, customerIds]
+    );
+
+    return res.json({
+      message: "Assignments updated",
+      updated_count: updateResult.rowCount,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error" });
   }
 });
 
@@ -1243,7 +1589,8 @@ router.post("/customers/import", authMiddleware, upload.single("file"), async (r
       if (normalized === "ownername") headerMap.owner_name = key;
       if (normalized === "city") headerMap.city = key;
       if (normalized === "email") headerMap.email = key;
-      if (normalized === "bv") headerMap.bv = key;
+      if (normalized === "contactemail") headerMap.contact_email = key;
+      if (normalized === "phone" || normalized === "phonenumber" || normalized === "mobile") headerMap.phone = key;
       if (normalized === "fuellinkcard") headerMap.fuellink_card = key;
       if (normalized === "otpsetup") headerMap.otp_setup = key;
       if (normalized === "deposit") headerMap.deposit = key;
@@ -1278,7 +1625,8 @@ router.post("/customers/import", authMiddleware, upload.single("file"), async (r
         const ownerName = headerMap.owner_name ? String(row[headerMap.owner_name] || "").trim() : null;
         const city = headerMap.city ? String(row[headerMap.city] || "").trim() : null;
         const email = headerMap.email ? String(row[headerMap.email] || "").trim() : null;
-        const bv = headerMap.bv ? String(row[headerMap.bv] || "").trim() : null;
+        const contactEmail = headerMap.contact_email ? String(row[headerMap.contact_email] || "").trim() : null;
+        const phone = headerMap.phone ? String(row[headerMap.phone] || "").trim() : null;
         const otpSetup = headerMap.otp_setup ? String(row[headerMap.otp_setup] || "").trim() : null;
         const address = headerMap.address ? String(row[headerMap.address] || "").trim() : null;
         const secInv = headerMap.security_deposit_invoice
@@ -1309,16 +1657,17 @@ router.post("/customers/import", authMiddleware, upload.single("file"), async (r
 
         const upsertResult = await pool.query(
           `INSERT INTO customers (
-            customer_number, company_name, owner_name, city, email, bv, fuellink_card, otp_setup,
+            customer_number, company_name, owner_name, city, email, contact_email, phone, fuellink_card, otp_setup,
             deposit, address, security_deposit_invoice, customer_status, reference_name, comment
           )
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
           ON CONFLICT (customer_number) DO UPDATE SET
             company_name = EXCLUDED.company_name,
             owner_name = EXCLUDED.owner_name,
             city = EXCLUDED.city,
             email = EXCLUDED.email,
-            bv = EXCLUDED.bv,
+            contact_email = EXCLUDED.contact_email,
+            phone = EXCLUDED.phone,
             fuellink_card = EXCLUDED.fuellink_card,
             otp_setup = EXCLUDED.otp_setup,
             deposit = EXCLUDED.deposit,
@@ -1334,7 +1683,8 @@ router.post("/customers/import", authMiddleware, upload.single("file"), async (r
             ownerName || null,
             city || null,
             email || null,
-            bv || null,
+            contactEmail || null,
+            phone || null,
             fuelLinkCard,
             otpSetup || null,
             deposit,
@@ -1398,6 +1748,153 @@ router.get("/customers/:id", authMiddleware, async (req, res) => {
   }
 });
 
+router.get("/customers/:id/portal-login", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const customerId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(customerId) || customerId < 1) {
+      return res.status(400).json({ message: "Invalid customer id" });
+    }
+
+    const result = await pool.query(
+      `SELECT email, must_change_password, last_login_at
+       FROM users
+       WHERE customer_id = $1 AND role = 'customer'
+       LIMIT 1`,
+      [customerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        exists: false,
+        email: null,
+        must_change_password: null,
+        last_login_at: null,
+      });
+    }
+
+    const row = result.rows[0];
+    return res.json({
+      exists: true,
+      email: row.email || null,
+      must_change_password: row.must_change_password ?? null,
+      last_login_at: row.last_login_at || null,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.post("/customers/:id/portal-login", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const customerId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(customerId) || customerId < 1) {
+      return res.status(400).json({ message: "Invalid customer id" });
+    }
+
+    let email = String(req.body?.email || "").trim();
+
+    if (!email) {
+      const customerResult = await pool.query(
+        "SELECT contact_email, email FROM customers WHERE id = $1",
+        [customerId]
+      );
+      if (customerResult.rows.length === 0) {
+        return res.status(404).json({ message: "Customer not found" });
+      }
+      const customerRow = customerResult.rows[0];
+      email = String(customerRow.contact_email || customerRow.email || "").trim();
+    }
+
+    if (!email) {
+      return res.status(400).json({ message: "email is required" });
+    }
+
+    const existingUser = await pool.query(
+      "SELECT id, email FROM users WHERE customer_id = $1 AND role = 'customer' LIMIT 1",
+      [customerId]
+    );
+
+    const tempPassword = generateTempPassword();
+    const hashedPassword = await bcrypt.hash(tempPassword, 10);
+
+    if (existingUser.rows.length > 0) {
+      const user = existingUser.rows[0];
+      await pool.query(
+        "UPDATE users SET password = $1, must_change_password = true WHERE id = $2",
+        [hashedPassword, user.id]
+      );
+
+      return res.json({
+        exists: true,
+        email: user.email,
+        temp_password: tempPassword,
+      });
+    }
+
+    await pool.query(
+      `INSERT INTO users (email, password, role, customer_id, must_change_password)
+       VALUES ($1, $2, 'customer', $3, true)
+       ON CONFLICT (email) DO UPDATE SET
+         customer_id = EXCLUDED.customer_id,
+         role = 'customer',
+         password = EXCLUDED.password,
+         must_change_password = true`,
+      [email, hashedPassword, customerId]
+    );
+
+    return res.json({
+      exists: true,
+      email,
+      temp_password: tempPassword,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.post("/customers/:id/portal-login/reset", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const customerId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(customerId) || customerId < 1) {
+      return res.status(400).json({ message: "Invalid customer id" });
+    }
+
+    const existingUser = await pool.query(
+      "SELECT id, email FROM users WHERE customer_id = $1 AND role = 'customer' LIMIT 1",
+      [customerId]
+    );
+
+    if (existingUser.rows.length === 0) {
+      return res.status(404).json({ message: "Customer portal user not found" });
+    }
+
+    const user = existingUser.rows[0];
+    const tempPassword = generateTempPassword();
+    const hashedPassword = await bcrypt.hash(tempPassword, 10);
+
+    await pool.query(
+      "UPDATE users SET password = $1, must_change_password = true WHERE id = $2",
+      [hashedPassword, user.id]
+    );
+
+    return res.json({
+      email: user.email,
+      temp_password: tempPassword,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
 router.post("/customers", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
@@ -1408,7 +1905,8 @@ router.post("/customers", authMiddleware, async (req, res) => {
       owner_name,
       city,
       email,
-      bv,
+      contact_email,
+      phone,
       fuellink_card,
       otp_setup,
       deposit,
@@ -1447,10 +1945,10 @@ router.post("/customers", authMiddleware, async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO customers (
-        customer_number, company_name, owner_name, city, email, bv, fuellink_card, otp_setup,
+        customer_number, company_name, owner_name, city, email, contact_email, phone, fuellink_card, otp_setup,
         deposit, address, security_deposit_invoice, customer_status, reference_name, comment
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       RETURNING ${customerColumns}`,
       [
         customerNumber,
@@ -1458,7 +1956,8 @@ router.post("/customers", authMiddleware, async (req, res) => {
         owner_name || null,
         city || null,
         email || null,
-        bv || null,
+        contact_email || null,
+        phone || null,
         fuellinkCard,
         otp_setup || null,
         depositNum,
@@ -1495,7 +1994,8 @@ router.patch("/customers/:id", authMiddleware, async (req, res) => {
       owner_name: "owner_name",
       city: "city",
       email: "email",
-      bv: "bv",
+      contact_email: "contact_email",
+      phone: "phone",
       fuellink_card: "fuellink_card",
       otp_setup: "otp_setup",
       deposit: "deposit",
@@ -1566,6 +2066,68 @@ router.patch("/customers/:id", authMiddleware, async (req, res) => {
       return res.status(409).json({ message: "customer_number already exists" });
     }
     console.error(err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+// =======================
+// CARDS (Admin)
+// =======================
+
+router.get("/cards", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const columnsResult = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'cards'`
+    );
+
+    const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+    const hasColumn = (name) => columns.has(name);
+    const selectExpr = (name, exprIfExists, alias) =>
+      (hasColumn(name) ? exprIfExists : "''") + ` AS "${alias}"`;
+
+    const driverNameExpr = hasColumn("driver_name_1")
+      ? hasColumn("driver_name")
+        ? "COALESCE(cd.driver_name_1, cd.driver_name, '')"
+        : "COALESCE(cd.driver_name_1, '')"
+      : hasColumn("driver_name")
+      ? "COALESCE(cd.driver_name, '')"
+      : "''";
+
+    const changeDateExpr = hasColumn("change_date")
+      ? "COALESCE(to_char(change_date, 'YYYY-MM-DD'), '')"
+      : "''";
+
+    const selectClauses = [
+      selectExpr("card_number", "COALESCE(card_number, '')", "Card #"),
+      `${changeDateExpr} AS "Change date"`,
+      selectExpr("status", "COALESCE(status, '')", "Status"),
+      `${driverNameExpr} AS "Driver Name 1"`,
+      selectExpr("pin", "COALESCE(pin, '')", "PIN #"),
+      `COALESCE(c.company_name, '') AS "Company Name"`,
+      `COALESCE(c.customer_number, '') AS "Customer Number"`,
+      selectExpr("customer_id", "customer_id", "customer_id"),
+    ];
+
+    const orderBy = hasColumn("updated_at")
+      ? "cd.updated_at DESC NULLS LAST, cd.id DESC"
+      : "cd.id DESC";
+
+    const result = await pool.query(
+      `SELECT
+         ${selectClauses.join(",\n         ")}
+       FROM cards cd
+       LEFT JOIN customers c ON c.id = cd.customer_id
+       ORDER BY ${orderBy}`
+    );
+
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Admin cards list error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
