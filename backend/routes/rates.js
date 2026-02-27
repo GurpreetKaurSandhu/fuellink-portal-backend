@@ -171,6 +171,13 @@ const parseRatesFile = (filePath) => {
   return parsed;
 };
 
+const hasCustomerRateGroupAssignmentsTable = async () => {
+  const result = await pool.query(
+    `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
+  );
+  return Boolean(result.rows[0]?.exists);
+};
+
 const ensureRatesSchemaCompat = async (client) => {
   // Make base-rates model work even on older DBs.
   await client.query("ALTER TABLE rates_files ALTER COLUMN customer_id DROP NOT NULL");
@@ -427,6 +434,22 @@ router.get("/", authMiddleware, async (req, res) => {
         where.push(`rl.site_name ILIKE $${values.length}`);
       }
 
+      const hasAssignments = await hasCustomerRateGroupAssignmentsTable();
+      const assignmentJoin = hasAssignments
+        ? `
+         LEFT JOIN LATERAL (
+           SELECT crga.rate_group_id
+           FROM customer_rate_group_assignments crga
+           WHERE crga.customer_id = c.id
+             AND crga.start_date <= $2::date
+             AND (crga.end_date IS NULL OR crga.end_date >= $2::date)
+           ORDER BY crga.start_date DESC, crga.id DESC
+           LIMIT 1
+         ) cra ON true
+         LEFT JOIN rate_groups rg ON rg.id = COALESCE(cra.rate_group_id, c.rate_group_id)
+        `
+        : `LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id`;
+
       const result = await pool.query(
         `SELECT
            rl.id,
@@ -440,7 +463,7 @@ router.get("/", authMiddleware, async (req, res) => {
          FROM rates_lines rl
          JOIN rates_files rf ON rl.rates_file_id = rf.id
          JOIN customers c ON c.id = $1
-         LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
+         ${assignmentJoin}
          WHERE ${where.join(" AND ")}
          ORDER BY rl.site_name ASC, rl.id ASC`,
         values

@@ -121,6 +121,20 @@ const ensureCustomersSchemaCompat = async () => {
   await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS rate_group_id INTEGER");
 };
 
+const ensureCustomerRateGroupAssignmentsSchemaCompat = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_rate_group_assignments (
+      id BIGSERIAL PRIMARY KEY,
+      customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      rate_group_id INTEGER NOT NULL REFERENCES rate_groups(id) ON DELETE RESTRICT,
+      start_date DATE NOT NULL,
+      end_date DATE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CHECK (end_date IS NULL OR end_date >= start_date)
+    )
+  `);
+};
+
 const ensureCardsHistorySchemaCompat = async (client) => {
   await client.query(`
     DO $$
@@ -1408,6 +1422,8 @@ router.post("/pricing/import", authMiddleware, upload.single("file"), async (req
 router.get("/rate-groups", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
+    await ensureCustomerRateGroupAssignmentsSchemaCompat();
 
     const [groupsResult, customersResult] = await Promise.all([
       pool.query(
@@ -1474,6 +1490,8 @@ router.post("/rate-groups", authMiddleware, async (req, res) => {
 router.post("/rate-groups/assign", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
+    await ensureCustomerRateGroupAssignmentsSchemaCompat();
 
     const rateGroupId = parseInt(req.body?.rate_group_id, 10);
     const customerIdsRaw = Array.isArray(req.body?.customer_ids) ? req.body.customer_ids : [];
@@ -1498,14 +1516,44 @@ router.post("/rate-groups/assign", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "rate_group_id does not exist" });
     }
 
-    const updateResult = await pool.query(
-      "UPDATE customers SET rate_group_id = $1 WHERE id = ANY($2::int[])",
-      [rateGroupId, customerIds]
-    );
+    const client = await pool.connect();
+    let updatedCount = 0;
+    try {
+      await client.query("BEGIN");
+
+      const updateResult = await client.query(
+        "UPDATE customers SET rate_group_id = $1 WHERE id = ANY($2::int[])",
+        [rateGroupId, customerIds]
+      );
+      updatedCount = updateResult.rowCount || 0;
+
+      await client.query(
+        `UPDATE customer_rate_group_assignments
+         SET end_date = GREATEST(start_date, (CURRENT_DATE - INTERVAL '1 day')::date)
+         WHERE customer_id = ANY($1::int[])
+           AND end_date IS NULL`,
+        [customerIds]
+      );
+
+      await client.query(
+        `INSERT INTO customer_rate_group_assignments (customer_id, rate_group_id, start_date, end_date)
+         SELECT id, $1, CURRENT_DATE, NULL
+         FROM unnest($2::int[]) AS id
+         ON CONFLICT DO NOTHING`,
+        [rateGroupId, customerIds]
+      );
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
 
     return res.json({
       message: "Assignments updated",
-      updated_count: updateResult.rowCount,
+      updated_count: updatedCount,
     });
   } catch (err) {
     console.error(err);
