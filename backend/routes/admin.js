@@ -133,6 +133,10 @@ const ensureCustomerRateGroupAssignmentsSchemaCompat = async () => {
       CHECK (end_date IS NULL OR end_date >= start_date)
     )
   `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_crga_customer_group_range
+      ON customer_rate_group_assignments (customer_id, rate_group_id, start_date, end_date)
+  `);
 };
 
 const ensureCardsHistorySchemaCompat = async (client) => {
@@ -1438,12 +1442,31 @@ router.get("/rate-groups", authMiddleware, async (req, res) => {
       ),
       pool.query(
         `SELECT
-           id,
-           customer_number,
-           company_name,
-           rate_group_id
-         FROM customers
-         ORDER BY company_name ASC NULLS LAST, id ASC`
+           c.id,
+           c.customer_number,
+           c.company_name,
+           c.rate_group_id,
+           COALESCE(active_crga.rate_group_id, c.rate_group_id) AS effective_rate_group_id,
+           rg_active.name AS effective_rate_group_name,
+           active_crga.start_date AS assigned_from,
+           active_crga.end_date AS assigned_to,
+           CASE
+             WHEN COALESCE(active_crga.rate_group_id, c.rate_group_id) IS NULL THEN 'UNASSIGNED'
+             ELSE 'ASSIGNED'
+           END AS assignment_status
+         FROM customers c
+         LEFT JOIN LATERAL (
+           SELECT crga.rate_group_id, crga.start_date, crga.end_date
+           FROM customer_rate_group_assignments crga
+           WHERE crga.customer_id = c.id
+             AND crga.start_date <= CURRENT_DATE
+             AND (crga.end_date IS NULL OR crga.end_date >= CURRENT_DATE)
+           ORDER BY crga.start_date DESC, crga.id DESC
+           LIMIT 1
+         ) active_crga ON true
+         LEFT JOIN rate_groups rg_active
+           ON rg_active.id = COALESCE(active_crga.rate_group_id, c.rate_group_id)
+         ORDER BY c.company_name ASC NULLS LAST, c.id ASC`
       ),
     ]);
 
@@ -1597,6 +1620,50 @@ router.patch("/customers/:id/rate-group", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.get("/rate-groups/assignments", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureCustomerRateGroupAssignmentsSchemaCompat();
+
+    const values = [];
+    const where = [];
+    if (req.query.customer_id) {
+      const customerId = parseInt(req.query.customer_id, 10);
+      if (!Number.isInteger(customerId) || customerId < 1) {
+        return res.status(400).json({ message: "Invalid customer_id" });
+      }
+      values.push(customerId);
+      where.push(`crga.customer_id = $${values.length}`);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const result = await pool.query(
+      `SELECT
+         crga.id,
+         crga.customer_id,
+         c.customer_number,
+         c.company_name,
+         crga.rate_group_id,
+         rg.name AS rate_group_name,
+         crga.start_date,
+         crga.end_date,
+         crga.created_at
+       FROM customer_rate_group_assignments crga
+       JOIN customers c ON c.id = crga.customer_id
+       JOIN rate_groups rg ON rg.id = crga.rate_group_id
+       ${whereSql}
+       ORDER BY crga.created_at DESC, crga.id DESC
+       LIMIT 5000`,
+      values
+    );
+
+    return res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error" });
   }
 });
 
