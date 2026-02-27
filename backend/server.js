@@ -1,8 +1,6 @@
-require("dotenv").config({ path: "../.env" });
-const supportRequestsRouter = require("./routes/supportRequests");
 const path = require("path");
+const supportRequestsRouter = require("./routes/supportRequests");
 require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
-
 const adminRoutes = require("./routes/admin");
 console.log("🔥 CLEAN SERVER VERSION 🔥");
 
@@ -19,7 +17,24 @@ const { recalculateTransactions } = require("./services/recalculateTransactions"
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // allow curl/postman
+    const allowed = [
+      "http://localhost:5173",
+      "https://fuellink-portal-frontend.vercel.app",
+    ];
+    if (allowed.includes(origin)) return cb(null, true);
+    if (origin.endsWith(".vercel.app")) return cb(null, true); // allow preview deployments
+    return cb(new Error("CORS blocked: " + origin));
+  },
+  
+  credentials: true,
+  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+app.use(express.json());
+
 app.use(express.json());
 app.use("/api/admin", adminRoutes);
 app.use("/api/auth", authRoutes);
@@ -32,6 +47,10 @@ app.use("/api", billedTransactionsRouter);
 app.get("/", async (req, res) => {
   const result = await pool.query("SELECT NOW()");
   res.json(result.rows);
+});
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, service: "fuellink-backend" });
 });
 
 app.get("/api/dashboard", authMiddleware, (req, res) => {

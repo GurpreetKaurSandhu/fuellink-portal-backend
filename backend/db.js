@@ -1,11 +1,15 @@
 const { Pool } = require("pg");
 
+const connectionString = process.env.DATABASE_URL;
+
+if (!connectionString) {
+  console.error("❌ DATABASE_URL is not set");
+}
+
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : undefined,
+  connectionString,
+  // Render Postgres requires SSL in most cases
+  ssl: connectionString ? { rejectUnauthorized: false } : false,
 });
 
 module.exports = pool;

@@ -32,10 +32,15 @@ router.post("/register", async (req, res) => {
 
 router.post("/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body?.email || "").trim();
+    const password = String(req.body?.password || "");
+
+    if (!email || !password) {
+      return res.status(400).json({ message: "email and password are required" });
+    }
 
     const user = await pool.query(
-      "SELECT * FROM users WHERE email = $1",
+      "SELECT * FROM users WHERE lower(trim(email)) = lower($1) LIMIT 1",
       [email]
     );
 

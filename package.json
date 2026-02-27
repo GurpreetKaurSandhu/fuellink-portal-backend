@@ -1,4 +1,11 @@
 {
+  "scripts": {
+    "build": "npm --prefix backend install",
+    "start": "npm --prefix backend start"
+  },
+  "engines": {
+    "node": "20.x"
+  },
   "devDependencies": {
     "@openai/codex": "^0.104.0"
   }
