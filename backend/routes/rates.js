@@ -171,6 +171,30 @@ const parseRatesFile = (filePath) => {
   return parsed;
 };
 
+const ensureRatesSchemaCompat = async (client) => {
+  // Make base-rates model work even on older DBs.
+  await client.query("ALTER TABLE rates_files ALTER COLUMN customer_id DROP NOT NULL");
+  await client.query("ALTER TABLE rates_lines ALTER COLUMN customer_id DROP NOT NULL");
+  await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS base_price NUMERIC(10,4)");
+
+  await client.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'rates_lines'
+          AND column_name = 'price'
+      ) THEN
+        UPDATE rates_lines
+        SET base_price = price
+        WHERE base_price IS NULL AND price IS NOT NULL;
+      END IF;
+    END $$;
+  `);
+};
+
 /**
  * POST /api/rates/upload
  * Admin can upload:
@@ -215,34 +239,75 @@ router.post("/upload", authMiddleware, upload.single("file"), async (req, res) =
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await ensureRatesSchemaCompat(client);
+
+      const rfColsResult = await client.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'rates_files'`
+      );
+      const rfCols = new Set(rfColsResult.rows.map((r) => r.column_name));
+
+      const fileColumns = [];
+      const fileValues = [];
+      const addFileColumn = (name, value) => {
+        if (rfCols.has(name)) {
+          fileColumns.push(name);
+          fileValues.push(value);
+        }
+      };
+      addFileColumn("customer_id", customerIdNum);
+      addFileColumn("original_filename", req.file.originalname);
+      addFileColumn("stored_filename", req.file.filename);
+      addFileColumn("uploaded_by_user_id", req.user.id || null);
+      addFileColumn("effective_date", effectiveDate || null);
+
+      if (fileColumns.length < 2) {
+        throw new Error("rates_files schema is missing required columns");
+      }
 
       const fileResult = await client.query(
         `INSERT INTO rates_files
-         (customer_id, original_filename, stored_filename, uploaded_by_user_id, effective_date)
-         VALUES ($1, $2, $3, $4, $5)
+         (${fileColumns.join(", ")})
+         VALUES (${fileColumns.map((_, idx) => `$${idx + 1}`).join(", ")})
          RETURNING id, effective_date, customer_id`,
-        [
-          customerIdNum, // can be null (BASE)
-          req.file.originalname,
-          req.file.filename,
-          req.user.id || null,
-          effectiveDate || null,
-        ]
+        fileValues
       );
 
       const ratesFileId = fileResult.rows[0].id;
 
-      // Insert lines
+      const rlColsResult = await client.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'rates_lines'`
+      );
+      const rlCols = new Set(rlColsResult.rows.map((r) => r.column_name));
+      const hasBasePrice = rlCols.has("base_price");
+      const hasPrice = rlCols.has("price");
+      if (!hasBasePrice && !hasPrice) {
+        throw new Error("rates_lines is missing price/base_price column");
+      }
+
+      // Insert lines (supports legacy price and new base_price schemas)
+      const lineColumns = ["rates_file_id", "customer_id", "site_name", "province"];
+      if (hasBasePrice) lineColumns.push("base_price");
+      if (hasPrice) lineColumns.push("price");
+
       const values = [];
       const placeholders = rows.map((row, idx) => {
-        const base = idx * 5;
-        values.push(ratesFileId, customerIdNum, row.site_name, row.province, row.base_price);
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
+        const rowValues = [ratesFileId, customerIdNum, row.site_name, row.province];
+        if (hasBasePrice) rowValues.push(row.base_price);
+        if (hasPrice) rowValues.push(row.base_price);
+        const base = values.length;
+        values.push(...rowValues);
+        return `(${rowValues.map((_, valueIdx) => `$${base + valueIdx + 1}`).join(", ")})`;
       });
 
       await client.query(
         `INSERT INTO rates_lines
-         (rates_file_id, customer_id, site_name, province, base_price)
+         (${lineColumns.join(", ")})
          VALUES ${placeholders.join(",")}`,
         values
       );

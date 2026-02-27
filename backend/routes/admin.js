@@ -999,31 +999,37 @@ const handleCardsImport = async (req, res) => {
             customerId = customerByCompany.get(companyKey);
           }
 
+          // Keep card row even if customer cannot be resolved yet.
+          // This preserves latest uploaded card master and allows later mapping.
           if (!customerId) {
-            throw new Error("Unable to resolve customer (customer_number/company_name/default customer)");
+            customerId = null;
           }
 
           const upsert = canWriteChangeDate
             ? await client.query(
-                `INSERT INTO cards (customer_id, card_number, driver_name, status, change_date)
-                 VALUES ($1, $2, $3, $4, $5)
+                `INSERT INTO cards (customer_id, card_number, driver_name, status, change_date, company_name, customer_number)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (card_number) DO UPDATE SET
                    customer_id = EXCLUDED.customer_id,
                    driver_name = COALESCE(EXCLUDED.driver_name, cards.driver_name),
                    status = EXCLUDED.status,
-                   change_date = COALESCE(EXCLUDED.change_date, cards.change_date)
-                 RETURNING id, customer_id, card_number, driver_name, status, (xmax = 0) AS inserted`,
-                [customerId, cardNumber, driverName, status, changeDate]
+                   change_date = COALESCE(EXCLUDED.change_date, cards.change_date),
+                   company_name = COALESCE(EXCLUDED.company_name, cards.company_name),
+                   customer_number = COALESCE(EXCLUDED.customer_number, cards.customer_number)
+                 RETURNING id, customer_id, card_number, driver_name, status, company_name, customer_number, (xmax = 0) AS inserted`,
+                [customerId, cardNumber, driverName, status, changeDate, rowCompanyName || null, rowCustomerNumber || null]
               )
             : await client.query(
-                `INSERT INTO cards (customer_id, card_number, driver_name, status)
-                 VALUES ($1, $2, $3, $4)
+                `INSERT INTO cards (customer_id, card_number, driver_name, status, company_name, customer_number)
+                 VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (card_number) DO UPDATE SET
                    customer_id = EXCLUDED.customer_id,
                    driver_name = COALESCE(EXCLUDED.driver_name, cards.driver_name),
-                   status = EXCLUDED.status
-                 RETURNING id, customer_id, card_number, driver_name, status, (xmax = 0) AS inserted`,
-                [customerId, cardNumber, driverName, status]
+                   status = EXCLUDED.status,
+                   company_name = COALESCE(EXCLUDED.company_name, cards.company_name),
+                   customer_number = COALESCE(EXCLUDED.customer_number, cards.customer_number)
+                 RETURNING id, customer_id, card_number, driver_name, status, company_name, customer_number, (xmax = 0) AS inserted`,
+                [customerId, cardNumber, driverName, status, rowCompanyName || null, rowCustomerNumber || null]
               );
 
           const card = upsert.rows[0];
@@ -2108,8 +2114,8 @@ router.get("/cards", authMiddleware, async (req, res) => {
       selectExpr("status", "COALESCE(status, '')", "Status"),
       `${driverNameExpr} AS "Driver Name 1"`,
       selectExpr("pin", "COALESCE(pin, '')", "PIN #"),
-      `COALESCE(c.company_name, '') AS "Company Name"`,
-      `COALESCE(c.customer_number, '') AS "Customer Number"`,
+      `COALESCE(c.company_name, cd.company_name, '') AS "Company Name"`,
+      `COALESCE(c.customer_number, cd.customer_number, '') AS "Customer Number"`,
       selectExpr("customer_id", "customer_id", "customer_id"),
     ];
 
