@@ -18,19 +18,11 @@ const { recalculateTransactions } = require("./services/recalculateTransactions"
 const app = express();
 
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow curl/postman
-    const allowed = [
-      "http://localhost:5173",
-      "https://fuellink-portal-frontend.vercel.app",
-    ];
-    if (allowed.includes(origin)) return cb(null, true);
-    if (origin.endsWith(".vercel.app")) return cb(null, true); // allow preview deployments
-    return cb(new Error("CORS blocked: " + origin));
-  },
-  
+  // Reflect any origin to avoid Vercel preflight failures.
+  // We still rely on JWT auth for protected endpoints.
+  origin: true,
   credentials: true,
-  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.use(express.json());
