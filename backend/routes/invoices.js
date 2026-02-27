@@ -74,9 +74,121 @@ const ensureSafePath = (storageKey) => {
   return resolved;
 };
 
+const ensureInvoicesSchemaCompat = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_invoices (
+      id bigserial PRIMARY KEY,
+      customer_id int NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      invoice_no text NOT NULL,
+      invoice_date date NOT NULL DEFAULT CURRENT_DATE,
+      period_start date,
+      period_end date,
+      subtotal numeric(12,2) NOT NULL DEFAULT 0,
+      gst numeric(12,2) NOT NULL DEFAULT 0,
+      hst numeric(12,2) NOT NULL DEFAULT 0,
+      pst numeric(12,2) NOT NULL DEFAULT 0,
+      qst numeric(12,2) NOT NULL DEFAULT 0,
+      total numeric(12,2) NOT NULL DEFAULT 0,
+      totals_provided boolean NOT NULL DEFAULT false,
+      status text NOT NULL DEFAULT 'issued',
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE customer_invoices
+      ADD COLUMN IF NOT EXISTS invoice_date date,
+      ADD COLUMN IF NOT EXISTS period_start date,
+      ADD COLUMN IF NOT EXISTS period_end date,
+      ADD COLUMN IF NOT EXISTS subtotal numeric(12,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS gst numeric(12,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS hst numeric(12,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS pst numeric(12,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS qst numeric(12,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS total numeric(12,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS totals_provided boolean DEFAULT false,
+      ADD COLUMN IF NOT EXISTS status text DEFAULT 'issued'
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'customer_invoices'
+          AND column_name = 'total_amount'
+      ) THEN
+        UPDATE customer_invoices
+        SET total = total_amount
+        WHERE total IS NULL AND total_amount IS NOT NULL;
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_invoice_files (
+      id bigserial PRIMARY KEY,
+      invoice_id bigint NOT NULL REFERENCES customer_invoices(id) ON DELETE CASCADE,
+      file_type text NOT NULL,
+      original_name text,
+      mime_type text,
+      size_bytes bigint,
+      storage_key text,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE customer_invoice_files
+      ADD COLUMN IF NOT EXISTS original_name text,
+      ADD COLUMN IF NOT EXISTS mime_type text,
+      ADD COLUMN IF NOT EXISTS size_bytes bigint,
+      ADD COLUMN IF NOT EXISTS storage_key text,
+      ADD COLUMN IF NOT EXISTS original_filename text,
+      ADD COLUMN IF NOT EXISTS stored_filename text
+  `);
+
+  await pool.query(`
+    UPDATE customer_invoice_files
+    SET storage_key = COALESCE(storage_key, stored_filename)
+    WHERE storage_key IS NULL AND stored_filename IS NOT NULL
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'uq_customer_invoices_customer_invoice_no'
+      ) THEN
+        ALTER TABLE customer_invoices
+          ADD CONSTRAINT uq_customer_invoices_customer_invoice_no UNIQUE (customer_id, invoice_no);
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'uq_customer_invoice_files_invoice_filetype'
+      ) THEN
+        ALTER TABLE customer_invoice_files
+          ADD CONSTRAINT uq_customer_invoice_files_invoice_filetype UNIQUE (invoice_id, file_type);
+      END IF;
+    END $$;
+  `);
+};
+
 router.get("/customers", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureInvoicesSchemaCompat();
 
     const result = await pool.query(
       "SELECT id, customer_number, company_name FROM customers ORDER BY company_name ASC"
@@ -98,6 +210,7 @@ router.post(
   async (req, res) => {
     try {
       if (!requireAdmin(req, res)) return;
+      await ensureInvoicesSchemaCompat();
 
       const customerIdNum = parseInt(req.body?.customer_id, 10);
       if (!Number.isInteger(customerIdNum) || customerIdNum < 1) {
@@ -281,6 +394,7 @@ router.post(
 router.get("/admin/invoices", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureInvoicesSchemaCompat();
 
     const values = [];
     let whereSql = "";
@@ -348,6 +462,7 @@ router.get("/admin/invoices", authMiddleware, async (req, res) => {
 router.patch("/admin/invoices/:invoiceId", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureInvoicesSchemaCompat();
 
     const invoiceId = parseInt(req.params.invoiceId, 10);
     if (!Number.isInteger(invoiceId) || invoiceId < 1) {
@@ -410,6 +525,7 @@ router.patch("/admin/invoices/:invoiceId", authMiddleware, async (req, res) => {
 
 router.get("/customer/invoices", authMiddleware, async (req, res) => {
   try {
+    await ensureInvoicesSchemaCompat();
     if (!req.user?.customer_id) {
       return res.status(403).json({ message: "Access denied" });
     }
@@ -503,6 +619,7 @@ const sendInvoiceFile = async ({ invoiceId, fileType, customerId }, res) => {
 
 router.get("/customer/invoices/:invoiceId/files/:fileType", authMiddleware, async (req, res) => {
   try {
+    await ensureInvoicesSchemaCompat();
     if (!req.user?.customer_id) {
       return res.status(403).json({ message: "Access denied" });
     }
@@ -529,6 +646,7 @@ router.get("/customer/invoices/:invoiceId/files/:fileType", authMiddleware, asyn
 router.get("/admin/invoices/:invoiceId/files/:fileType", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureInvoicesSchemaCompat();
 
     const invoiceId = parseInt(req.params.invoiceId, 10);
     const fileType = req.params.fileType;

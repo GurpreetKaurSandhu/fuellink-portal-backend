@@ -120,6 +120,20 @@ const ensureCustomersSchemaCompat = async () => {
   await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS comment TEXT");
   await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS rate_group_id INTEGER");
 };
+
+const ensureCardsHistorySchemaCompat = async (client) => {
+  await client.query(`
+    DO $$
+    BEGIN
+      IF to_regclass('public.cards_history') IS NOT NULL THEN
+        ALTER TABLE public.cards_history
+          ADD COLUMN IF NOT EXISTS status VARCHAR(20),
+          ADD COLUMN IF NOT EXISTS driver_name VARCHAR(150),
+          ADD COLUMN IF NOT EXISTS changed_by_user_id INTEGER;
+      END IF;
+    END $$;
+  `);
+};
 const resolveCustomerId = async (customer_id, customer_number) => {
   const customerNumber = String(customer_number || "").trim();
   if (customerNumber) {
@@ -977,6 +991,7 @@ const handleCardsImport = async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await ensureCardsHistorySchemaCompat(client);
 
       const cardsHistoryExistsResult = await client.query(
         `SELECT to_regclass('public.cards_history') IS NOT NULL AS exists`
