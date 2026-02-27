@@ -75,8 +75,20 @@ const parseBooleanish = (value, fallback = true) => {
   if (value == null) return fallback;
   if (typeof value === "boolean") return value;
   const normalized = String(value).trim().toLowerCase();
-  if (normalized === "true" || normalized === "1" || normalized === "yes") return true;
-  if (normalized === "false" || normalized === "0" || normalized === "no") return false;
+  if (
+    normalized === "true" ||
+    normalized === "1" ||
+    normalized === "yes" ||
+    normalized === "active" ||
+    normalized === "enabled"
+  ) return true;
+  if (
+    normalized === "false" ||
+    normalized === "0" ||
+    normalized === "no" ||
+    normalized === "inactive" ||
+    normalized === "disabled"
+  ) return false;
   return fallback;
 };
 
@@ -92,6 +104,22 @@ const requireAdmin = (req, res) => {
 
 const generateTempPassword = () => crypto.randomBytes(6).toString("hex");
 
+const ensureCustomersSchemaCompat = async () => {
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS owner_name TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS city TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS email TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS contact_email TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS phone TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS fuellink_card INTEGER");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS otp_setup TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS deposit NUMERIC(12,2)");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS address TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS security_deposit_invoice TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_status BOOLEAN DEFAULT true");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS reference_name TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS comment TEXT");
+  await pool.query("ALTER TABLE customers ADD COLUMN IF NOT EXISTS rate_group_id INTEGER");
+};
 const resolveCustomerId = async (customer_id, customer_number) => {
   const customerNumber = String(customer_number || "").trim();
   if (customerNumber) {
@@ -950,6 +978,11 @@ const handleCardsImport = async (req, res) => {
     try {
       await client.query("BEGIN");
 
+      const cardsHistoryExistsResult = await client.query(
+        `SELECT to_regclass('public.cards_history') IS NOT NULL AS exists`
+      );
+      const hasCardsHistory = Boolean(cardsHistoryExistsResult.rows[0]?.exists);
+
       const columnsResult = await client.query(
         `SELECT column_name
          FROM information_schema.columns
@@ -1033,12 +1066,14 @@ const handleCardsImport = async (req, res) => {
               );
 
           const card = upsert.rows[0];
-          await client.query(
-            `INSERT INTO cards_history
-             (card_id, customer_id, card_number, driver_name, status, changed_by_user_id)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [card.id, card.customer_id, card.card_number, card.driver_name, card.status, req.user.id || null]
-          );
+          if (hasCardsHistory) {
+            await client.query(
+              `INSERT INTO cards_history
+               (card_id, customer_id, card_number, driver_name, status, changed_by_user_id)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [card.id, card.customer_id, card.card_number, card.driver_name, card.status, req.user.id || null]
+            );
+          }
 
           if (card.inserted) insertedCount += 1;
           else updatedCount += 1;
@@ -1055,6 +1090,16 @@ const handleCardsImport = async (req, res) => {
       throw err;
     } finally {
       client.release();
+    }
+
+    if (insertedCount + updatedCount === 0) {
+      return res.status(400).json({
+        message: errors[0]?.error || "No cards were imported from the file",
+        inserted_count: insertedCount,
+        updated_count: updatedCount,
+        errors,
+        note: "PIN fields are ignored and not stored",
+      });
     }
 
     return res.json({
@@ -1495,6 +1540,7 @@ router.patch("/customers/:id/rate-group", authMiddleware, async (req, res) => {
 router.get("/customers/lookup", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
 
     const customerNumber = String(req.query.customer_number || "").trim();
     if (!customerNumber) {
@@ -1522,6 +1568,7 @@ router.get("/customers/lookup", authMiddleware, async (req, res) => {
 router.get("/customers", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
 
     const q = String(req.query.q || "").trim();
     const values = [];
@@ -1560,6 +1607,7 @@ router.post("/customers/import", authMiddleware, upload.single("file"), async (r
       safeUnlink(req.file?.path);
       return;
     }
+    await ensureCustomersSchemaCompat();
 
     if (!req.file) {
       return res.status(400).json({ message: "No file received" });
@@ -1730,6 +1778,7 @@ router.post("/customers/import", authMiddleware, upload.single("file"), async (r
 router.get("/customers/:id", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
 
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id < 1) {
@@ -1757,6 +1806,7 @@ router.get("/customers/:id", authMiddleware, async (req, res) => {
 router.get("/customers/:id/portal-login", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
 
     const customerId = parseInt(req.params.id, 10);
     if (!Number.isInteger(customerId) || customerId < 1) {
@@ -1796,6 +1846,7 @@ router.get("/customers/:id/portal-login", authMiddleware, async (req, res) => {
 router.post("/customers/:id/portal-login", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
 
     const customerId = parseInt(req.params.id, 10);
     if (!Number.isInteger(customerId) || customerId < 1) {
@@ -1904,6 +1955,7 @@ router.post("/customers/:id/portal-login/reset", authMiddleware, async (req, res
 router.post("/customers", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
 
     const {
       customer_number,
@@ -1988,6 +2040,7 @@ router.post("/customers", authMiddleware, async (req, res) => {
 router.patch("/customers/:id", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureCustomersSchemaCompat();
 
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id < 1) {

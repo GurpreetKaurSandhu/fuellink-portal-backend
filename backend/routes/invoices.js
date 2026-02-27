@@ -27,6 +27,11 @@ const sanitizeInvoiceNo = (value) => {
   return cleaned || "invoice";
 };
 
+const generateInvoiceNo = () =>
+  `AUTO-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${Math.floor(Math.random() * 1e6)
+    .toString()
+    .padStart(6, "0")}`;
+
 const parseOptionalNumber = (value) => {
   if (value == null) return null;
   const trimmed = String(value).trim();
@@ -99,10 +104,8 @@ router.post(
         return res.status(400).json({ message: "Invalid customer_id" });
       }
 
-      const invoiceNo = String(req.body?.invoice_no || "").trim();
-      if (!invoiceNo) {
-        return res.status(400).json({ message: "invoice_no is required" });
-      }
+      const invoiceNoInput = String(req.body?.invoice_no || "").trim();
+      const invoiceNo = invoiceNoInput || generateInvoiceNo();
 
       const invoiceDateRaw = String(req.body?.invoice_date || "").trim();
       const periodStartRaw = String(req.body?.period_start || "").trim();
