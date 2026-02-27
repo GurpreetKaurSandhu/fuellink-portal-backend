@@ -31,6 +31,17 @@ router.get("/", authMiddleware, async (req, res) => {
     const customerId = req.user.customer_id;
     if (!customerId) return res.status(400).json({ message: "Missing customer_id" });
 
+    const customerResult = await pool.query(
+      `SELECT customer_number, company_name
+       FROM customers
+       WHERE id = $1
+       LIMIT 1`,
+      [customerId]
+    );
+    const customer = customerResult.rows[0] || {};
+    const customerNumber = String(customer.customer_number || "").trim();
+    const companyName = String(customer.company_name || "").trim();
+
     const result = await pool.query(
       `SELECT
          card_number,
@@ -39,9 +50,21 @@ router.get("/", authMiddleware, async (req, res) => {
          company_name,
          customer_number
        FROM cards
-       WHERE customer_id = $1
+       WHERE
+         customer_id = $1
+         OR (
+           customer_id IS NULL
+           AND (
+             ($2 <> '' AND lower(trim(COALESCE(cards.customer_number, ''))) = lower(trim($2)))
+             OR (
+               $3 <> ''
+               AND regexp_replace(lower(COALESCE(cards.company_name, '')), '[^a-z0-9]+', '', 'g') =
+                   regexp_replace(lower($3), '[^a-z0-9]+', '', 'g')
+             )
+           )
+         )
        ORDER BY id DESC`,
-      [customerId]
+      [customerId, customerNumber, companyName]
     );
 
     return res.json(result.rows);

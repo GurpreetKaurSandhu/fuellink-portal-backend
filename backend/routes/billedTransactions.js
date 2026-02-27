@@ -51,6 +51,7 @@ const ensureSchema = async () => {
           id BIGSERIAL PRIMARY KEY,
           upload_id BIGINT REFERENCES billed_transaction_uploads(id) ON DELETE SET NULL,
           customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+          customer_number TEXT,
           company_name TEXT,
           card_number TEXT,
           transaction_date DATE,
@@ -81,6 +82,7 @@ const ensureSchema = async () => {
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_billed_transactions_customer ON billed_transactions(customer_id, transaction_date DESC)`);
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_billed_transactions_invoice ON billed_transactions(invoice_number)`);
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_billed_transactions_upload ON billed_transactions(upload_id)`);
+      await pool.query(`ALTER TABLE billed_transactions ADD COLUMN IF NOT EXISTS customer_number TEXT`);
     })().catch((err) => {
       schemaInitPromise = null;
       throw err;
@@ -220,7 +222,7 @@ router.post(
     const byCustomerNumber = new Map();
     const byCompanyName = new Map();
     for (const customer of customerResult.rows) {
-      if (customer.customer_number) byCustomerNumber.set(String(customer.customer_number).trim().toLowerCase(), customer.id);
+      if (customer.customer_number) byCustomerNumber.set(normalizeName(customer.customer_number), customer.id);
       const key = normalizeName(customer.company_name);
       if (key) byCompanyName.set(key, customer.id);
     }
@@ -264,7 +266,7 @@ router.post(
 
           let customerId = null;
           if (customerNumberRaw) {
-            customerId = byCustomerNumber.get(customerNumberRaw.toLowerCase()) || null;
+            customerId = byCustomerNumber.get(normalizeName(customerNumberRaw)) || null;
           }
           if (!customerId) {
             customerId = byCompanyName.get(normalizeName(companyName)) || null;
@@ -276,21 +278,22 @@ router.post(
 
           await client.query(
             `INSERT INTO billed_transactions (
-              upload_id, customer_id, company_name, card_number, transaction_date,
+              upload_id, customer_id, customer_number, company_name, card_number, transaction_date,
               location, city, province, document_number, product,
               volume_liters, base_rate, fet, pft, rate_per_ltr,
               subtotal, gst, pst, qst, amount,
               driver_name, invoice_number, invoice_date, period_billed, raw_row
             ) VALUES (
-              $1,$2,$3,$4,$5,
-              $6,$7,$8,$9,$10,
-              $11,$12,$13,$14,$15,
-              $16,$17,$18,$19,$20,
-              $21,$22,$23,$24,$25
+              $1,$2,$3,$4,$5,$6,
+              $7,$8,$9,$10,$11,
+              $12,$13,$14,$15,$16,
+              $17,$18,$19,$20,$21,
+              $22,$23,$24,$25,$26
             )`,
             [
               uploadId,
               customerId,
+              customerNumberRaw || null,
               companyName,
               String(row[headerMap.card_number] || "").trim() || null,
               parseDateOnly(row[headerMap.transaction_date]),
@@ -407,8 +410,25 @@ router.get("/customer/billed-transactions", authMiddleware, async (req, res) => 
   }
 
   try {
-    const values = [req.user.customer_id];
-    const where = ["bt.customer_id = $1"];
+    const customerResult = await pool.query(
+      "SELECT customer_number, company_name FROM customers WHERE id = $1 LIMIT 1",
+      [req.user.customer_id]
+    );
+    const customer = customerResult.rows[0] || {};
+    const customerNumber = String(customer.customer_number || "").trim();
+    const companyName = String(customer.company_name || "").trim();
+
+    const values = [req.user.customer_id, customerNumber, companyName];
+    const where = [
+      `(bt.customer_id = $1 OR (
+          bt.customer_id IS NULL AND (
+            ($2 <> '' AND regexp_replace(lower(COALESCE(bt.customer_number, '')), '[^a-z0-9]+', '', 'g') =
+                        regexp_replace(lower($2), '[^a-z0-9]+', '', 'g'))
+            OR ($3 <> '' AND regexp_replace(lower(COALESCE(bt.company_name, '')), '[^a-z0-9]+', '', 'g') =
+                         regexp_replace(lower($3), '[^a-z0-9]+', '', 'g'))
+          )
+        ))`
+    ];
 
     if (req.query.invoice_number) {
       values.push(String(req.query.invoice_number).trim());
@@ -463,8 +483,25 @@ router.get("/customer/billed-transactions/export", authMiddleware, async (req, r
   }
 
   try {
-    const values = [req.user.customer_id];
-    const where = ["bt.customer_id = $1"];
+    const customerResult = await pool.query(
+      "SELECT customer_number, company_name FROM customers WHERE id = $1 LIMIT 1",
+      [req.user.customer_id]
+    );
+    const customer = customerResult.rows[0] || {};
+    const customerNumber = String(customer.customer_number || "").trim();
+    const companyName = String(customer.company_name || "").trim();
+
+    const values = [req.user.customer_id, customerNumber, companyName];
+    const where = [
+      `(bt.customer_id = $1 OR (
+          bt.customer_id IS NULL AND (
+            ($2 <> '' AND regexp_replace(lower(COALESCE(bt.customer_number, '')), '[^a-z0-9]+', '', 'g') =
+                        regexp_replace(lower($2), '[^a-z0-9]+', '', 'g'))
+            OR ($3 <> '' AND regexp_replace(lower(COALESCE(bt.company_name, '')), '[^a-z0-9]+', '', 'g') =
+                         regexp_replace(lower($3), '[^a-z0-9]+', '', 'g'))
+          )
+        ))`
+    ];
 
     if (req.query.invoice_number) {
       values.push(String(req.query.invoice_number).trim());
