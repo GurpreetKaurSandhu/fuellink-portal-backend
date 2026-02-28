@@ -1517,6 +1517,10 @@ router.post("/rate-groups/assign", authMiddleware, async (req, res) => {
     await ensureCustomerRateGroupAssignmentsSchemaCompat();
 
     const rateGroupId = parseInt(req.body?.rate_group_id, 10);
+    const startDateRaw = String(req.body?.start_date || "").trim();
+    const endDateRaw = String(req.body?.end_date || "").trim();
+    const startDate = startDateRaw || new Date().toISOString().slice(0, 10);
+    const endDate = endDateRaw || null;
     const customerIdsRaw = Array.isArray(req.body?.customer_ids) ? req.body.customer_ids : [];
     const customerIds = Array.from(
       new Set(
@@ -1532,6 +1536,15 @@ router.post("/rate-groups/assign", authMiddleware, async (req, res) => {
 
     if (customerIds.length === 0) {
       return res.status(400).json({ message: "customer_ids must include at least one customer" });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+      return res.status(400).json({ message: "Invalid start_date (use YYYY-MM-DD)" });
+    }
+    if (endDate && !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+      return res.status(400).json({ message: "Invalid end_date (use YYYY-MM-DD)" });
+    }
+    if (endDate && endDate < startDate) {
+      return res.status(400).json({ message: "end_date must be >= start_date" });
     }
 
     const groupResult = await pool.query("SELECT id FROM rate_groups WHERE id = $1", [rateGroupId]);
@@ -1552,18 +1565,18 @@ router.post("/rate-groups/assign", authMiddleware, async (req, res) => {
 
       await client.query(
         `UPDATE customer_rate_group_assignments
-         SET end_date = GREATEST(start_date, (CURRENT_DATE - INTERVAL '1 day')::date)
+         SET end_date = GREATEST(start_date, ($2::date - INTERVAL '1 day')::date)
          WHERE customer_id = ANY($1::int[])
            AND end_date IS NULL`,
-        [customerIds]
+        [customerIds, startDate]
       );
 
       await client.query(
         `INSERT INTO customer_rate_group_assignments (customer_id, rate_group_id, start_date, end_date)
-         SELECT id, $1, CURRENT_DATE, NULL
+         SELECT id, $1, $3::date, $4::date
          FROM unnest($2::int[]) AS id
          ON CONFLICT DO NOTHING`,
-        [rateGroupId, customerIds]
+        [rateGroupId, customerIds, startDate, endDate]
       );
 
       await client.query("COMMIT");
