@@ -650,7 +650,7 @@ const parsePdfTransactionLines = (text) => {
     .map((line) => String(line || "").replace(/\s+/g, " ").trim())
     .filter(Boolean);
   const parsed = [];
-  const dateTimeRegex = /(20\d{2}[/-]\d{2}[/-]\d{2})\s+(\d{2}:\d{2})/;
+  const dateTimeRegex = /(20\d{2}[/-]\d{2}[/-]\d{2})(?:\s+(\d{2}:\d{2}))?/;
   const cleanDriver = (value) =>
     String(value || "")
       .replace(/\s+/g, " ")
@@ -665,29 +665,36 @@ const parsePdfTransactionLines = (text) => {
     const dt = line.match(dateTimeRegex);
     if (!dt) return null;
     const dtStart = dt.index || 0;
-    const dtToken = `${dt[1]} ${dt[2]}`;
+    const dtToken = `${dt[1]}${dt[2] ? ` ${dt[2]}` : ""}`;
     const purchase_datetime = parseDateTime(dtToken);
     if (!purchase_datetime) return null;
 
     const left = line.slice(0, dtStart).trim();
     const right = line.slice(dtStart + dt[0].length).trim();
 
-    const cardMatch = left.match(/^(\d{4,})/);
+    const cardMatch = left.match(/^(\d{4})/);
     if (!cardMatch) return null;
     const card_number = cardMatch[1];
     const driver_name = cleanDriver(left.slice(cardMatch[0].length));
 
-    // Pattern: PRODUCT + VOLUME + AMOUNT + DOCUMENT + LOCATION...
-    // Example: DSL-LS184.90241.3426055251P 42148 HIGHWAY # 1COCHRANEAB
     const compact = right.replace(/\s+/g, " ");
-    const m = compact.match(/^([A-Z][A-Z0-9\- ]*?)(\d+\.\d{2})(\d+\.\d{2})([A-Z0-9]{6,})(.*)$/i);
-    if (!m) return null;
+    const productMatch = compact.match(/\b(DSL-LS|DEF BULK|DEF|DSL|ULS|GAS|REG|PREM)\b/i);
+    if (!productMatch) return null;
+    const product = String(productMatch[1] || "").trim().toUpperCase();
 
-    const product = String(m[1] || "").trim();
-    const volume_liters = parseNumber(m[2]);
-    const amount = parseNumber(m[3]);
-    const document_number = String(m[4] || "").trim() || null;
-    const locationRaw = String(m[5] || "").trim();
+    const afterProduct = compact.slice((productMatch.index || 0) + productMatch[0].length);
+    const numbersAfterProduct = afterProduct.match(/\d+\.\d{2}/g) || [];
+    const volume_liters = parseNumber(numbersAfterProduct[0]);
+    const amount = parseNumber(numbersAfterProduct[1] || null);
+    if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 2000) return null;
+
+    const beforeProduct = compact.slice(0, productMatch.index || 0).trim();
+    const docCandidateBefore = beforeProduct.match(/([A-Z0-9]{6,})\s*$/i);
+    const docCandidateAfter = afterProduct.match(/\b([A-Z0-9]{6,})\b/i);
+    const document_number = String(
+      (docCandidateBefore && docCandidateBefore[1]) || (docCandidateAfter && docCandidateAfter[1]) || ""
+    ).trim() || null;
+    const locationRaw = beforeProduct.replace(/([A-Z0-9]{6,})\s*$/i, "").trim();
     const location = locationRaw || null;
 
     if (!product || /^(to|from|category|all)$/i.test(product)) return null;
@@ -885,21 +892,32 @@ const resolveCustomerIdByCard = async (client, rawCardNumber) => {
   const last4 = digits.length >= 4 ? digits.slice(-4) : "";
 
   const result = await client.query(
-    `SELECT customer_id
-     FROM cards
-     WHERE customer_id IS NOT NULL
+    `SELECT DISTINCT COALESCE(cd.customer_id, cnum.id, cname.id) AS customer_id
+     FROM cards cd
+     LEFT JOIN customers cnum
+       ON cnum.customer_number IS NOT NULL
+      AND cd.customer_number IS NOT NULL
+      AND lower(trim(cnum.customer_number)) = lower(trim(cd.customer_number))
+     LEFT JOIN customers cname
+       ON cname.company_name IS NOT NULL
+      AND cd.company_name IS NOT NULL
+      AND lower(trim(cname.company_name)) = lower(trim(cd.company_name))
+     WHERE COALESCE(cd.customer_id, cnum.id, cname.id) IS NOT NULL
        AND (
-         card_number = $1
-         OR regexp_replace(card_number, '\\D', '', 'g') = $2
-         OR ($3 <> '' AND right(regexp_replace(card_number, '\\D', '', 'g'), 4) = $3)
+         cd.card_number = $1
+         OR regexp_replace(cd.card_number, '\\D', '', 'g') = $2
+         OR (
+           $3 <> ''
+           AND lpad(right(regexp_replace(cd.card_number, '\\D', '', 'g'), 4), 4, '0') = lpad($3, 4, '0')
+         )
        )
      ORDER BY
        CASE
-         WHEN card_number = $1 THEN 0
-         WHEN regexp_replace(card_number, '\\D', '', 'g') = $2 THEN 1
+         WHEN cd.card_number = $1 THEN 0
+         WHEN regexp_replace(cd.card_number, '\\D', '', 'g') = $2 THEN 1
          ELSE 2
        END,
-       id DESC
+       cd.id DESC
      LIMIT 10`,
     [raw, digits, last4]
   );
@@ -3102,10 +3120,26 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
            COALESCE(t.total_amount, 0)
          )
            t.*,
-           c.customer_number,
-           c.company_name
+           COALESCE(c.customer_number, c_map.customer_number, card_map.customer_number) AS customer_number,
+           COALESCE(c.company_name, c_map.company_name, card_map.company_name) AS company_name
          FROM transactions t
          LEFT JOIN customers c ON c.id = t.customer_id
+         LEFT JOIN LATERAL (
+           SELECT
+             cd.customer_id AS mapped_customer_id,
+             cd.customer_number,
+             cd.company_name
+           FROM cards cd
+           WHERE cd.card_number = t.card_number
+              OR regexp_replace(cd.card_number, '\\D', '', 'g') = regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+              OR (
+                right(regexp_replace(cd.card_number, '\\D', '', 'g'), 4) <> ''
+                AND right(regexp_replace(cd.card_number, '\\D', '', 'g'), 4) = right(regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g'), 4)
+              )
+           ORDER BY cd.id DESC
+           LIMIT 1
+         ) card_map ON TRUE
+         LEFT JOIN customers c_map ON c_map.id = card_map.mapped_customer_id
          ${whereSql}
          ORDER BY
            COALESCE(t.customer_id, -1),
