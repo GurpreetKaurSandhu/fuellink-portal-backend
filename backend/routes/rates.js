@@ -661,6 +661,7 @@ router.get("/", authMiddleware, async (req, res) => {
            ${pick("pst_per_liter")},
            ${pick("fet_per_liter")},
            ${pick("pft_per_liter")},
+           rg.name AS rate_group_name,
            COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
            ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
            rf.effective_date
@@ -741,6 +742,7 @@ router.get("/", authMiddleware, async (req, res) => {
       `SELECT rl.id, rl.rates_file_id, rl.customer_id, rl.site_name,
               rl.province, ${pickText("site_number")}, ${basePriceExpr} AS base_price, ${pick("base_tax_excl")},
               ${pick("price_excl_gst_hst")}, ${pick("pst_per_liter")}, ${pick("fet_per_liter")}, ${pick("pft_per_liter")},
+              rg.name AS rate_group_name,
               COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
               ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
               rl.created_at, rf.effective_date
