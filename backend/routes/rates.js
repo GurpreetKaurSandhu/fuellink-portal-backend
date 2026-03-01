@@ -128,10 +128,9 @@ const parseRatesFile = (filePath) => {
   for (let i = 0; i < matrix.length; i += 1) {
     const row = matrix[i] || [];
     const normalized = row.map((cell) => normalizeHeader(cell));
-    const hasSiteNumber = normalized.some((v) => v === "sitenumber" || v === "site");
-    const hasSiteName = normalized.some((v) => v === "sitename" || v === "site");
+    const hasSiteName = normalized.some((v) => v === "sitename");
     const hasProvince = normalized.some((v) => v === "prv" || v === "province" || v === "prov");
-    if (hasSiteNumber && hasSiteName && hasProvince) {
+    if (hasSiteName && hasProvince) {
       headerRowIndex = i;
       break;
     }
@@ -209,7 +208,14 @@ const parseRatesFile = (filePath) => {
     const prev2 = normalizeHeader(prevPrevHeaderRow[col]);
     const merged = normalizeHeader(`${prev2} ${prev} ${now}`);
 
-    if (!headerMap.site_number && (now === "sitenumber" || merged.includes("sitenumber"))) {
+    if (
+      headerMap.site_number == null &&
+      (
+        now === "sitenumber" ||
+        merged.includes("sitenumber") ||
+        (now === "number" && (prev === "site" || prev2 === "site"))
+      )
+    ) {
       headerMap.site_number = col;
     }
     if (!headerMap.site_name && (now === "sitename" || now === "site" || merged.includes("sitename"))) {
@@ -220,7 +226,11 @@ const parseRatesFile = (filePath) => {
     }
     if (
       headerMap.price_excl_gst_hst == null &&
-      (merged.includes("priceexclgsthst") || (merged.includes("price") && merged.includes("gsthst")))
+      (
+        merged.includes("priceexclgsthst") ||
+        merged.includes("pricegsthst") ||
+        (merged.includes("price") && merged.includes("excl") && merged.includes("gsthst"))
+      )
     ) {
       headerMap.price_excl_gst_hst = col;
     }
@@ -248,10 +258,10 @@ const parseRatesFile = (filePath) => {
   }
 
   if (headerMap.site_name == null || headerMap.province == null) {
-    throw new Error("Missing required columns: Site Name, Province");
+    throw new Error("Missing required columns: Site Name, Prv");
   }
   if (headerMap.base_tax_excl == null && headerMap.price_excl_gst_hst == null) {
-    throw new Error("Missing required pricing column: TAX $/L or PRICE* EXCL GST/HST");
+    throw new Error("Missing required pricing column: TAX $/L (BASE PRICE EXCL TAX) or PRICE* EXCL GST/HST");
   }
 
   const parsed = [];
@@ -304,6 +314,16 @@ const hasCustomerRateGroupAssignmentsTable = async () => {
     `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
   );
   return Boolean(result.rows[0]?.exists);
+};
+
+const getRatesLinesColumns = async () => {
+  const result = await pool.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'rates_lines'`
+  );
+  return new Set(result.rows.map((row) => row.column_name));
 };
 
 const ensureRatesSchemaCompat = async (client) => {
@@ -540,6 +560,12 @@ router.get("/", authMiddleware, async (req, res) => {
   try {
     const { customer_id, effective_date, province, site_name } = req.query;
     const isAdmin = req.user && req.user.role === "admin";
+    const rlCols = await getRatesLinesColumns();
+    const pick = (col, alias = col) => (rlCols.has(col) ? `rl.${col} AS ${alias}` : `NULL::numeric AS ${alias}`);
+    const pickText = (col, alias = col) => (rlCols.has(col) ? `rl.${col} AS ${alias}` : `NULL::text AS ${alias}`);
+    const basePriceExpr = rlCols.has("base_price")
+      ? "rl.base_price"
+      : (rlCols.has("price") ? "rl.price" : "NULL::numeric");
 
     if (!isAdmin) {
       if (!req.user || !req.user.customer_id) {
@@ -570,7 +596,7 @@ router.get("/", authMiddleware, async (req, res) => {
       const where = [
         "rf.customer_id IS NULL",
         "rl.customer_id IS NULL",
-        "rl.base_price IS NOT NULL",
+        `${basePriceExpr} IS NOT NULL`,
         "rf.effective_date = $2",
       ];
 
@@ -605,15 +631,15 @@ router.get("/", authMiddleware, async (req, res) => {
            rl.rates_file_id,
            rl.site_name,
            rl.province,
-           rl.site_number,
-           rl.base_price,
-           rl.base_tax_excl,
-           rl.price_excl_gst_hst,
-           rl.pst_per_liter,
-           rl.fet_per_liter,
-           rl.pft_per_liter,
+           ${pickText("site_number")},
+           ${basePriceExpr} AS base_price,
+           ${pick("base_tax_excl")},
+           ${pick("price_excl_gst_hst")},
+           ${pick("pst_per_liter")},
+           ${pick("fet_per_liter")},
+           ${pick("pft_per_liter")},
            COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
-           (rl.base_price + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
+           ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
            rf.effective_date
          FROM rates_lines rl
          JOIN rates_files rf ON rl.rates_file_id = rf.id
@@ -690,9 +716,9 @@ router.get("/", authMiddleware, async (req, res) => {
 
     const result = await pool.query(
       `SELECT rl.id, rl.rates_file_id, rl.customer_id, rl.site_name,
-              rl.province, rl.site_number, rl.base_price, rl.base_tax_excl,
-              rl.price_excl_gst_hst, rl.pst_per_liter, rl.fet_per_liter, rl.pft_per_liter,
-              rl.base_price AS price,
+              rl.province, ${pickText("site_number")}, ${basePriceExpr} AS base_price, ${pick("base_tax_excl")},
+              ${pick("price_excl_gst_hst")}, ${pick("pst_per_liter")}, ${pick("fet_per_liter")}, ${pick("pft_per_liter")},
+              ${basePriceExpr} AS price,
               rl.created_at, rf.effective_date
        FROM rates_lines rl
        JOIN rates_files rf ON rl.rates_file_id = rf.id

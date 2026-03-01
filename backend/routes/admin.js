@@ -1035,6 +1035,7 @@ router.post(
         let inserted = 0;
         let skipped = 0;
         let unmatched = 0;
+        const unmatchedCards = new Set();
 
         await client.query("BEGIN");
 
@@ -1043,6 +1044,7 @@ router.post(
             const customerId = await resolveCustomerIdByCard(client, row.card_number);
             if (!customerId) {
               unmatched += 1;
+              if (row.card_number) unmatchedCards.add(String(row.card_number));
             }
 
             const amountKey = row.amount;
@@ -1119,6 +1121,7 @@ router.post(
           rows_inserted: inserted,
           rows_skipped: skipped,
           rows_unmatched: unmatched,
+          unmatched_card_sample: Array.from(unmatchedCards).slice(0, 25),
           parse_status: "done",
         });
       } catch (err) {
