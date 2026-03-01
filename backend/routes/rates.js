@@ -234,7 +234,12 @@ const parseRatesFile = (filePath) => {
     ) {
       headerMap.price_excl_gst_hst = col;
     }
-    if (headerMap.pst_per_liter == null && (merged.includes("pst") || now.includes("pst"))) {
+    if (
+      headerMap.pst_per_liter == null &&
+      (merged.includes("pst") || now.includes("pst")) &&
+      !merged.includes("gsthst") &&
+      !merged.includes("price")
+    ) {
       headerMap.pst_per_liter = col;
     }
     if (headerMap.fet_per_liter == null && (merged.includes("fet") || now.includes("fet"))) {
@@ -262,6 +267,24 @@ const parseRatesFile = (filePath) => {
   }
   if (headerMap.base_tax_excl == null && headerMap.price_excl_gst_hst == null) {
     throw new Error("Missing required pricing column: TAX $/L (BASE PRICE EXCL TAX) or PRICE* EXCL GST/HST");
+  }
+
+  // Petro-Pass report often comes in a stable 9-column layout.
+  // If header text parsing is ambiguous, use positional mapping.
+  if (
+    headerRow.length >= 7 &&
+    headerMap.site_name != null &&
+    headerMap.province != null &&
+    headerMap.price_excl_gst_hst == null
+  ) {
+    headerMap.site_number = headerMap.site_number ?? 0;
+    headerMap.site_name = 1;
+    headerMap.province = 2;
+    headerMap.price_excl_gst_hst = 3;
+    headerMap.fet_per_liter = headerMap.fet_per_liter ?? 4;
+    headerMap.pft_per_liter = headerMap.pft_per_liter ?? 5;
+    headerMap.base_tax_excl = headerMap.base_tax_excl ?? 6;
+    headerMap.effective_date = headerMap.effective_date ?? 7;
   }
 
   const parsed = [];
@@ -718,10 +741,13 @@ router.get("/", authMiddleware, async (req, res) => {
       `SELECT rl.id, rl.rates_file_id, rl.customer_id, rl.site_name,
               rl.province, ${pickText("site_number")}, ${basePriceExpr} AS base_price, ${pick("base_tax_excl")},
               ${pick("price_excl_gst_hst")}, ${pick("pst_per_liter")}, ${pick("fet_per_liter")}, ${pick("pft_per_liter")},
-              ${basePriceExpr} AS price,
+              COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
+              ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
               rl.created_at, rf.effective_date
        FROM rates_lines rl
        JOIN rates_files rf ON rl.rates_file_id = rf.id
+       LEFT JOIN customers c ON c.id = rl.customer_id
+       LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
        WHERE ${where.join(" AND ")}
        ORDER BY rl.site_name ASC, rl.id ASC`,
       values

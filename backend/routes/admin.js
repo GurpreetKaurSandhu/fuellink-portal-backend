@@ -659,6 +659,9 @@ const parsePdfTransactionLines = (text) => {
     /^\d{1,2}:\d{2}(?::\d{2})?[AP]M$/i.test(token);
 
   for (const line of lines) {
+    if (/category\s*:/i.test(line) || /all\s+transactions/i.test(line) || /purchase\s+date/i.test(line)) {
+      continue;
+    }
     const tokens = line.split(/\s+/).filter(Boolean);
     if (tokens.length < 7) continue;
 
@@ -700,6 +703,7 @@ const parsePdfTransactionLines = (text) => {
     if (dataStart >= tokens.length) continue;
 
     const product = tokens[dataStart] || null;
+    if (!product || /^(to|from|category|all)$/i.test(product)) continue;
 
     let volumeIdx = -1;
     for (let i = dataStart + 1; i < Math.min(tokens.length, dataStart + 8); i += 1) {
@@ -711,7 +715,7 @@ const parsePdfTransactionLines = (text) => {
     }
     if (volumeIdx < 0) continue;
     const volume_liters = parseNumber(tokens[volumeIdx]);
-    if (!Number.isFinite(volume_liters)) continue;
+    if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 1000) continue;
 
     let amountIdx = -1;
     for (let i = volumeIdx + 1; i < Math.min(tokens.length, volumeIdx + 8); i += 1) {
@@ -727,6 +731,7 @@ const parsePdfTransactionLines = (text) => {
     const document_number = tokens[docIdx] || null;
     const location = tokens.slice(docIdx + 1).join(" ").trim() || null;
     const driver_name = tokens.slice(cardIdx + 1, dateIdx).join(" ").trim() || null;
+    if (/purchase\s*date|all\s*transactions|category/i.test(`${driver_name} ${location}`)) continue;
 
     const numericExtras = tokens.map((token) => parseNumber(token)).filter((value) => Number.isFinite(value));
 
@@ -767,6 +772,18 @@ const parsePdfTransactionLines = (text) => {
     const location = String(match[9] || "").trim() || null;
 
     if (card_number.length >= 4 && purchase_datetime && Number.isFinite(volume_liters)) {
+      if (volume_liters <= 0 || volume_liters > 1000) {
+        match = rowRegex.exec(compactText);
+        continue;
+      }
+      if (!product || /^(to|from|category|all)$/i.test(product)) {
+        match = rowRegex.exec(compactText);
+        continue;
+      }
+      if (/purchase\s*date|all\s*transactions|category/i.test(`${driver_name || ""} ${location || ""}`)) {
+        match = rowRegex.exec(compactText);
+        continue;
+      }
       parsed.push({
         card_number,
         driver_name,
