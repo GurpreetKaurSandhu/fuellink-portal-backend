@@ -94,81 +94,209 @@ const resolveCustomerIdOrNull = async (customer_id, customer_number) => {
   return customerIdNum;
 };
 
+const parseNumber = (value) => {
+  if (value == null) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const cleaned = String(value).replace(/[$,]/g, "").trim();
+  if (!cleaned) return null;
+  const parsed = parseFloat(cleaned);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
 const parseRatesFile = (filePath) => {
   const workbook = XLSX.readFile(filePath, { cellDates: true, raw: true });
   const sheetName = workbook.SheetNames[0];
   if (!sheetName) throw new Error("No worksheet found in file");
 
   const sheet = workbook.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null });
-
-  if (!Array.isArray(rows) || rows.length === 0) {
+  const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, raw: true, blankrows: false });
+  if (!Array.isArray(matrix) || matrix.length === 0) {
     throw new Error("File is empty or missing header row");
   }
 
-  const headerMap = {};
-
-  // accept variations
-  for (const key of Object.keys(rows[0] || {})) {
-    const normalized = normalizeHeader(key);
-
-    // site name
-    if (!headerMap.site_name && (normalized === "sitename" || normalized === "site" || normalized === "location")) {
-      headerMap.site_name = key;
-    }
-
-    // province
-    if (
-      !headerMap.province &&
-      (normalized === "province" || normalized === "prov" || normalized === "prv" || normalized === "pr")
-    ) {
-      headerMap.province = key;
-    }
-
-    // price
-    if (
-      !headerMap.base_price &&
-      (normalized === "price" || normalized === "price*" || normalized === "rate" || normalized === "priceperlitre")
-    ) {
-      headerMap.base_price = key;
+  let effectiveDateFromFile = null;
+  for (let i = 0; i < Math.min(12, matrix.length); i += 1) {
+    const joined = (matrix[i] || []).map((cell) => String(cell || "")).join(" ");
+    const match = joined.match(/as of:\s*(\d{4}-\d{2}-\d{2})/i);
+    if (match) {
+      effectiveDateFromFile = match[1];
+      break;
     }
   }
 
-  if (!headerMap.site_name || !headerMap.province || !headerMap.base_price) {
-    throw new Error("Missing required columns: Site Name, Province, Price");
+  let headerRowIndex = -1;
+  for (let i = 0; i < matrix.length; i += 1) {
+    const row = matrix[i] || [];
+    const normalized = row.map((cell) => normalizeHeader(cell));
+    const hasSiteNumber = normalized.some((v) => v === "sitenumber" || v === "site");
+    const hasSiteName = normalized.some((v) => v === "sitename" || v === "site");
+    const hasProvince = normalized.some((v) => v === "prv" || v === "province" || v === "prov");
+    if (hasSiteNumber && hasSiteName && hasProvince) {
+      headerRowIndex = i;
+      break;
+    }
+  }
+
+  if (headerRowIndex === -1) {
+    // Fallback for simple one-row headers: Site Name / Province / Price
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: null });
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new Error("File is empty or missing header row");
+    }
+
+    const headerMap = {};
+    for (const key of Object.keys(rows[0] || {})) {
+      const normalized = normalizeHeader(key);
+      if (!headerMap.site_name && (normalized === "sitename" || normalized === "site" || normalized === "location")) {
+        headerMap.site_name = key;
+      }
+      if (
+        !headerMap.province &&
+        (normalized === "province" || normalized === "prov" || normalized === "prv" || normalized === "pr")
+      ) {
+        headerMap.province = key;
+      }
+      if (
+        !headerMap.base_price &&
+        (normalized === "price" || normalized === "price*" || normalized === "rate" || normalized === "priceperlitre")
+      ) {
+        headerMap.base_price = key;
+      }
+    }
+
+    if (!headerMap.site_name || !headerMap.province || !headerMap.base_price) {
+      throw new Error("Missing required columns: Site Name, Province, Price");
+    }
+
+    const parsed = [];
+    rows.forEach((row, idx) => {
+      const site_name = String(row[headerMap.site_name] || "").trim();
+      const province = String(row[headerMap.province] || "").trim();
+      const basePriceNum = parseNumber(row[headerMap.base_price]);
+
+      if (!site_name && !province && basePriceNum == null) return;
+      if (!site_name) throw new Error(`Missing site_name at row ${idx + 2}`);
+      if (!province) throw new Error(`Missing province at row ${idx + 2}`);
+      if (province.length > 10) throw new Error(`Province too long at row ${idx + 2}`);
+      if (!Number.isFinite(basePriceNum)) throw new Error(`Invalid price at row ${idx + 2}`);
+
+      parsed.push({
+        site_number: null,
+        site_name,
+        province,
+        base_price: basePriceNum,
+        base_tax_excl: basePriceNum,
+        price_excl_gst_hst: null,
+        pst_per_liter: null,
+        fet_per_liter: null,
+        pft_per_liter: null,
+        effective_date: null,
+      });
+    });
+
+    if (parsed.length === 0) throw new Error("No valid data rows found");
+    return { rows: parsed, effectiveDateFromFile };
+  }
+
+  const headerRow = matrix[headerRowIndex] || [];
+  const prevHeaderRow = matrix[headerRowIndex - 1] || [];
+  const prevPrevHeaderRow = matrix[headerRowIndex - 2] || [];
+
+  const headerMap = {};
+  for (let col = 0; col < headerRow.length; col += 1) {
+    const now = normalizeHeader(headerRow[col]);
+    const prev = normalizeHeader(prevHeaderRow[col]);
+    const prev2 = normalizeHeader(prevPrevHeaderRow[col]);
+    const merged = normalizeHeader(`${prev2} ${prev} ${now}`);
+
+    if (!headerMap.site_number && (now === "sitenumber" || merged.includes("sitenumber"))) {
+      headerMap.site_number = col;
+    }
+    if (!headerMap.site_name && (now === "sitename" || now === "site" || merged.includes("sitename"))) {
+      headerMap.site_name = col;
+    }
+    if (!headerMap.province && (now === "prv" || now === "province" || now === "prov")) {
+      headerMap.province = col;
+    }
+    if (
+      headerMap.price_excl_gst_hst == null &&
+      (merged.includes("priceexclgsthst") || (merged.includes("price") && merged.includes("gsthst")))
+    ) {
+      headerMap.price_excl_gst_hst = col;
+    }
+    if (headerMap.pst_per_liter == null && (merged.includes("pst") || now.includes("pst"))) {
+      headerMap.pst_per_liter = col;
+    }
+    if (headerMap.fet_per_liter == null && (merged.includes("fet") || now.includes("fet"))) {
+      headerMap.fet_per_liter = col;
+    }
+    if (
+      headerMap.pft_per_liter == null &&
+      (merged.includes("pft") || merged.includes("utt") || now.includes("pft") || now.includes("utt"))
+    ) {
+      headerMap.pft_per_liter = col;
+    }
+    if (
+      headerMap.base_tax_excl == null &&
+      (merged.includes("taxl") || merged.includes("basepriceexcl") || merged.includes("base"))
+    ) {
+      headerMap.base_tax_excl = col;
+    }
+    if (!headerMap.effective_date && merged.includes("effectivedate")) {
+      headerMap.effective_date = col;
+    }
+  }
+
+  if (headerMap.site_name == null || headerMap.province == null) {
+    throw new Error("Missing required columns: Site Name, Province");
+  }
+  if (headerMap.base_tax_excl == null && headerMap.price_excl_gst_hst == null) {
+    throw new Error("Missing required pricing column: TAX $/L or PRICE* EXCL GST/HST");
   }
 
   const parsed = [];
 
-  rows.forEach((row, idx) => {
-    const rawSite = row[headerMap.site_name];
-    const rawProvince = row[headerMap.province];
-    const rawPrice = row[headerMap.base_price];
+  for (let i = headerRowIndex + 1; i < matrix.length; i += 1) {
+    const row = matrix[i] || [];
+    const firstCell = String(row[0] || "").trim();
+    if (!firstCell && !row.some((v) => String(v || "").trim())) continue;
+    if (/^-{3,}$/.test(firstCell.replace(/\s+/g, ""))) continue;
 
-    // skip totally blank lines
-    if (rawSite == null && rawProvince == null && rawPrice == null) return;
+    const site_name = String(row[headerMap.site_name] || "").trim();
+    const province = String(row[headerMap.province] || "").trim();
+    if (!site_name || !province) continue;
+    if (province.length > 10) throw new Error(`Province too long at row ${i + 1}`);
 
-    const site_name = String(rawSite || "").trim();
-    const province = String(rawProvince || "").trim();
-
-    let basePrice = rawPrice;
-    if (typeof basePrice === "string") {
-      basePrice = basePrice.replace(/[$,]/g, "").trim();
+    const baseTaxExcl = parseNumber(row[headerMap.base_tax_excl]);
+    const priceExclGstHst = parseNumber(row[headerMap.price_excl_gst_hst]);
+    const basePriceNum = baseTaxExcl ?? priceExclGstHst;
+    if (!Number.isFinite(basePriceNum)) {
+      throw new Error(`Invalid base price at row ${i + 1}`);
     }
-    const basePriceNum =
-      typeof basePrice === "number" ? basePrice : parseFloat(String(basePrice || ""));
 
-    if (!site_name) throw new Error(`Missing site_name at row ${idx + 2}`);
-    if (!province) throw new Error(`Missing province at row ${idx + 2}`);
-    if (province.length > 10) throw new Error(`Province too long at row ${idx + 2}`);
-    if (!Number.isFinite(basePriceNum)) throw new Error(`Invalid price at row ${idx + 2}`);
+    const rowEffectiveDateRaw = headerMap.effective_date != null ? row[headerMap.effective_date] : null;
+    const rowEffectiveDate =
+      rowEffectiveDateRaw && /^\d{4}-\d{2}-\d{2}$/.test(String(rowEffectiveDateRaw).trim())
+        ? String(rowEffectiveDateRaw).trim()
+        : null;
 
-    parsed.push({ site_name, province, base_price: basePriceNum });
-  });
+    parsed.push({
+      site_number: String(row[headerMap.site_number] || "").trim() || null,
+      site_name,
+      province,
+      base_price: basePriceNum,
+      base_tax_excl: baseTaxExcl ?? null,
+      price_excl_gst_hst: priceExclGstHst ?? null,
+      pst_per_liter: parseNumber(row[headerMap.pst_per_liter]),
+      fet_per_liter: parseNumber(row[headerMap.fet_per_liter]),
+      pft_per_liter: parseNumber(row[headerMap.pft_per_liter]),
+      effective_date: rowEffectiveDate,
+    });
+  }
 
   if (parsed.length === 0) throw new Error("No valid data rows found");
 
-  return parsed;
+  return { rows: parsed, effectiveDateFromFile };
 };
 
 const hasCustomerRateGroupAssignmentsTable = async () => {
@@ -183,6 +311,12 @@ const ensureRatesSchemaCompat = async (client) => {
   await client.query("ALTER TABLE rates_files ALTER COLUMN customer_id DROP NOT NULL");
   await client.query("ALTER TABLE rates_lines ALTER COLUMN customer_id DROP NOT NULL");
   await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS base_price NUMERIC(10,4)");
+  await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS site_number TEXT");
+  await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS price_excl_gst_hst NUMERIC(10,4)");
+  await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS pst_per_liter NUMERIC(10,4)");
+  await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS fet_per_liter NUMERIC(10,4)");
+  await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS pft_per_liter NUMERIC(10,4)");
+  await client.query("ALTER TABLE rates_lines ADD COLUMN IF NOT EXISTS base_tax_excl NUMERIC(10,4)");
 
   await client.query(`
     DO $$
@@ -231,17 +365,19 @@ router.post("/upload", authMiddleware, upload.single("file"), async (req, res) =
       return res.status(400).json({ message: err.message });
     }
 
-    const effectiveDate = req.body.effective_date ? String(req.body.effective_date).trim() : null;
-    if (effectiveDate && !isValidDateString(effectiveDate)) {
+    const requestedEffectiveDate = req.body.effective_date ? String(req.body.effective_date).trim() : null;
+    if (requestedEffectiveDate && !isValidDateString(requestedEffectiveDate)) {
       return res.status(400).json({ message: "Invalid effective_date (use YYYY-MM-DD)" });
     }
 
-    let rows;
+    let parsedFile;
     try {
-      rows = parseRatesFile(req.file.path);
+      parsedFile = parseRatesFile(req.file.path);
     } catch (err) {
       return res.status(400).json({ message: err.message });
     }
+    const effectiveDate = requestedEffectiveDate || parsedFile.effectiveDateFromFile || null;
+    const rows = parsedFile.rows;
 
     const client = await pool.connect();
     try {
@@ -301,12 +437,24 @@ router.post("/upload", authMiddleware, upload.single("file"), async (req, res) =
       const lineColumns = ["rates_file_id", "customer_id", "site_name", "province"];
       if (hasBasePrice) lineColumns.push("base_price");
       if (hasPrice) lineColumns.push("price");
+      if (rlCols.has("site_number")) lineColumns.push("site_number");
+      if (rlCols.has("price_excl_gst_hst")) lineColumns.push("price_excl_gst_hst");
+      if (rlCols.has("pst_per_liter")) lineColumns.push("pst_per_liter");
+      if (rlCols.has("fet_per_liter")) lineColumns.push("fet_per_liter");
+      if (rlCols.has("pft_per_liter")) lineColumns.push("pft_per_liter");
+      if (rlCols.has("base_tax_excl")) lineColumns.push("base_tax_excl");
 
       const values = [];
       const placeholders = rows.map((row, idx) => {
         const rowValues = [ratesFileId, customerIdNum, row.site_name, row.province];
         if (hasBasePrice) rowValues.push(row.base_price);
         if (hasPrice) rowValues.push(row.base_price);
+        if (rlCols.has("site_number")) rowValues.push(row.site_number);
+        if (rlCols.has("price_excl_gst_hst")) rowValues.push(row.price_excl_gst_hst);
+        if (rlCols.has("pst_per_liter")) rowValues.push(row.pst_per_liter);
+        if (rlCols.has("fet_per_liter")) rowValues.push(row.fet_per_liter);
+        if (rlCols.has("pft_per_liter")) rowValues.push(row.pft_per_liter);
+        if (rlCols.has("base_tax_excl")) rowValues.push(row.base_tax_excl ?? row.base_price);
         const base = values.length;
         values.push(...rowValues);
         return `(${rowValues.map((_, valueIdx) => `$${base + valueIdx + 1}`).join(", ")})`;
@@ -327,6 +475,7 @@ router.post("/upload", authMiddleware, upload.single("file"), async (req, res) =
         customer_id: customerIdNum,
         effective_date: formatDate(fileResult.rows[0].effective_date),
         rows_inserted: rows.length,
+        breakdown_columns: ["site_number", "price_excl_gst_hst", "pst_per_liter", "fet_per_liter", "pft_per_liter", "base_tax_excl"],
       });
     } catch (err) {
       await client.query("ROLLBACK");
@@ -456,7 +605,13 @@ router.get("/", authMiddleware, async (req, res) => {
            rl.rates_file_id,
            rl.site_name,
            rl.province,
+           rl.site_number,
            rl.base_price,
+           rl.base_tax_excl,
+           rl.price_excl_gst_hst,
+           rl.pst_per_liter,
+           rl.fet_per_liter,
+           rl.pft_per_liter,
            COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
            (rl.base_price + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
            rf.effective_date
@@ -535,7 +690,8 @@ router.get("/", authMiddleware, async (req, res) => {
 
     const result = await pool.query(
       `SELECT rl.id, rl.rates_file_id, rl.customer_id, rl.site_name,
-              rl.province, rl.base_price,
+              rl.province, rl.site_number, rl.base_price, rl.base_tax_excl,
+              rl.price_excl_gst_hst, rl.pst_per_liter, rl.fet_per_liter, rl.pft_per_liter,
               rl.base_price AS price,
               rl.created_at, rf.effective_date
        FROM rates_lines rl
