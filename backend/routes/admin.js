@@ -653,21 +653,31 @@ const parsePdfTransactionLines = (text) => {
     const tokens = line.split(/\s+/).filter(Boolean);
     if (tokens.length < 8) continue;
 
-    const firstTokenDigits = String(tokens[0] || "").replace(/\D/g, "");
-    if (firstTokenDigits.length < 4) continue;
-    const card_number = firstTokenDigits;
-
     const dateIdx = tokens.findIndex((token, idx) => idx > 0 && (
       /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/.test(token) ||
       /^\d{1,2}[/-]\d{1,2}[/-]\d{4}$/.test(token)
     ));
     if (dateIdx < 0 || dateIdx + 3 >= tokens.length) continue;
 
+    // Card number is not always first token in PDF extracts.
+    let cardIdx = -1;
+    for (let i = dateIdx - 1; i >= 0; i -= 1) {
+      const digitCandidate = String(tokens[i] || "").replace(/\D/g, "");
+      if (digitCandidate.length >= 4) {
+        cardIdx = i;
+        break;
+      }
+    }
+    if (cardIdx < 0) continue;
+    const cardDigits = String(tokens[cardIdx] || "").replace(/\D/g, "");
+    if (cardDigits.length < 4) continue;
+    const card_number = cardDigits;
+
     const timeToken = tokens[dateIdx + 1];
     const ampmToken = /^[AP]M$/i.test(tokens[dateIdx + 2] || "") ? tokens[dateIdx + 2] : "";
     const afterTimeOffset = ampmToken ? 3 : 2;
 
-    const driver_name = tokens.slice(1, dateIdx).join(" ").trim() || null;
+    const driver_name = tokens.slice(cardIdx + 1, dateIdx).join(" ").trim() || null;
     const dateToken = tokens[dateIdx];
     const purchase_datetime = parseDateTime(
       `${dateToken} ${timeToken}${ampmToken ? ` ${ampmToken}` : ""}`.trim()
@@ -1001,6 +1011,7 @@ router.post(
         summary.push({
           upload_id: uploadId,
           original_filename: file.originalname,
+          parsed_rows: rows.length,
           rows_inserted: inserted,
           rows_skipped: skipped,
           rows_unmatched: unmatched,
@@ -1026,6 +1037,7 @@ router.post(
         summary.push({
           upload_id: uploadId,
           original_filename: file.originalname,
+          parsed_rows: 0,
           parse_status: "failed",
           parse_error: String(err.message || "Unknown parse error"),
         });
