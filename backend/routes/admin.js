@@ -27,7 +27,9 @@ const safeUnlink = (filePath) => {
 const extractProvince = (location) => {
   if (!location) return null;
   const match = String(location).match(/\b(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)\b/i);
-  return match ? match[1].toUpperCase() : null;
+  if (match) return match[1].toUpperCase();
+  const tail = String(location).trim().match(/(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)$/i);
+  return tail ? tail[1].toUpperCase() : null;
 };
 
 const normalizeHeader = (value) =>
@@ -648,6 +650,67 @@ const parsePdfTransactionLines = (text) => {
     .map((line) => String(line || "").replace(/\s+/g, " ").trim())
     .filter(Boolean);
   const parsed = [];
+  const dateTimeRegex = /(20\d{2}[/-]\d{2}[/-]\d{2})\s+(\d{2}:\d{2})/;
+  const cleanDriver = (value) =>
+    String(value || "")
+      .replace(/\s+/g, " ")
+      .replace(/([A-Za-z])(\d{3,})/g, "$1 $2")
+      .trim();
+  const tryParseCompactLine = (rawLine) => {
+    const line = String(rawLine || "").replace(/\s+/g, " ").trim();
+    if (!line) return null;
+    if (!dateTimeRegex.test(line)) return null;
+    if (/selection\s*:|product category|page\s*:/i.test(line)) return null;
+
+    const dt = line.match(dateTimeRegex);
+    if (!dt) return null;
+    const dtStart = dt.index || 0;
+    const dtToken = `${dt[1]} ${dt[2]}`;
+    const purchase_datetime = parseDateTime(dtToken);
+    if (!purchase_datetime) return null;
+
+    const left = line.slice(0, dtStart).trim();
+    const right = line.slice(dtStart + dt[0].length).trim();
+
+    const cardMatch = left.match(/^(\d{4,})/);
+    if (!cardMatch) return null;
+    const card_number = cardMatch[1];
+    const driver_name = cleanDriver(left.slice(cardMatch[0].length));
+
+    // Pattern: PRODUCT + VOLUME + AMOUNT + DOCUMENT + LOCATION...
+    // Example: DSL-LS184.90241.3426055251P 42148 HIGHWAY # 1COCHRANEAB
+    const compact = right.replace(/\s+/g, " ");
+    const m = compact.match(/^([A-Z][A-Z0-9\- ]*?)(\d+\.\d{2})(\d+\.\d{2})([A-Z0-9]{6,})(.*)$/i);
+    if (!m) return null;
+
+    const product = String(m[1] || "").trim();
+    const volume_liters = parseNumber(m[2]);
+    const amount = parseNumber(m[3]);
+    const document_number = String(m[4] || "").trim() || null;
+    const locationRaw = String(m[5] || "").trim();
+    const location = locationRaw || null;
+
+    if (!product || /^(to|from|category|all)$/i.test(product)) return null;
+    if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 2000) return null;
+
+    return {
+      card_number,
+      driver_name: driver_name || null,
+      purchase_datetime,
+      location,
+      city: null,
+      province: extractProvince(location),
+      document_number,
+      product,
+      volume_liters,
+      amount: Number.isFinite(amount) ? amount : null,
+      source_raw_json: {
+        amount: Number.isFinite(amount) ? amount : null,
+        raw_line: line,
+        parser_mode: "compact-line",
+      },
+    };
+  };
 
   const isDateToken = (token) =>
     /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/.test(token) ||
@@ -754,6 +817,13 @@ const parsePdfTransactionLines = (text) => {
     });
   }
 
+  if (parsed.length > 0) return parsed;
+
+  // Secondary attempt for compact line formats from Petro-Pass exports.
+  for (const line of lines) {
+    const row = tryParseCompactLine(line);
+    if (row) parsed.push(row);
+  }
   if (parsed.length > 0) return parsed;
 
   // Fallback for PDFs where row text is not split line-by-line predictably.
