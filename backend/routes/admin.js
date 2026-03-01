@@ -643,59 +643,92 @@ const customerColumns = `
 `;
 
 const parsePdfTransactionLines = (text) => {
-  const lines = String(text || "").split(/\r?\n/);
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => String(line || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
   const parsed = [];
 
-  for (const rawLine of lines) {
-    const line = String(rawLine || "").trim();
-    if (!line) continue;
+  const isDateToken = (token) =>
+    /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/.test(token) ||
+    /^\d{1,2}[/-]\d{1,2}[/-]\d{4}$/.test(token) ||
+    /^\d{1,2}-[A-Za-z]{3}-\d{4}$/.test(token);
 
+  const isTimeToken = (token) =>
+    /^\d{1,2}:\d{2}(?::\d{2})?$/.test(token) ||
+    /^\d{1,2}:\d{2}(?::\d{2})?[AP]M$/i.test(token);
+
+  for (const line of lines) {
     const tokens = line.split(/\s+/).filter(Boolean);
-    if (tokens.length < 8) continue;
+    if (tokens.length < 7) continue;
 
-    const dateIdx = tokens.findIndex((token, idx) => idx > 0 && (
-      /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/.test(token) ||
-      /^\d{1,2}[/-]\d{1,2}[/-]\d{4}$/.test(token)
-    ));
-    if (dateIdx < 0 || dateIdx + 3 >= tokens.length) continue;
+    let dateIdx = -1;
+    for (let i = 0; i < tokens.length; i += 1) {
+      if (isDateToken(tokens[i])) {
+        dateIdx = i;
+        break;
+      }
+    }
+    if (dateIdx < 0) continue;
 
-    // Card number is not always first token in PDF extracts.
     let cardIdx = -1;
     for (let i = dateIdx - 1; i >= 0; i -= 1) {
-      const digitCandidate = String(tokens[i] || "").replace(/\D/g, "");
-      if (digitCandidate.length >= 4) {
+      const digits = String(tokens[i] || "").replace(/\D/g, "");
+      if (digits.length >= 4) {
         cardIdx = i;
         break;
       }
     }
     if (cardIdx < 0) continue;
+
     const cardDigits = String(tokens[cardIdx] || "").replace(/\D/g, "");
     if (cardDigits.length < 4) continue;
     const card_number = cardDigits;
 
-    const timeToken = tokens[dateIdx + 1];
-    const ampmToken = /^[AP]M$/i.test(tokens[dateIdx + 2] || "") ? tokens[dateIdx + 2] : "";
-    const afterTimeOffset = ampmToken ? 3 : 2;
+    const rawDate = tokens[dateIdx];
+    const rawTime = tokens[dateIdx + 1] || "";
+    const rawAmPm = /^[AP]M$/i.test(tokens[dateIdx + 2] || "") ? tokens[dateIdx + 2] : "";
+    const hasTime = isTimeToken(rawTime);
+    const afterTimeOffset = hasTime ? (rawAmPm ? 3 : 2) : 1;
 
-    const driver_name = tokens.slice(cardIdx + 1, dateIdx).join(" ").trim() || null;
-    const dateToken = tokens[dateIdx];
     const purchase_datetime = parseDateTime(
-      `${dateToken} ${timeToken}${ampmToken ? ` ${ampmToken}` : ""}`.trim()
+      `${rawDate}${hasTime ? ` ${rawTime}` : ""}${rawAmPm ? ` ${rawAmPm}` : ""}`.trim()
     );
     if (!purchase_datetime) continue;
 
-    const product = tokens[dateIdx + afterTimeOffset] || null;
-    const volume_liters = parseNumber(tokens[dateIdx + afterTimeOffset + 1]);
+    const dataStart = dateIdx + afterTimeOffset;
+    if (dataStart >= tokens.length) continue;
+
+    const product = tokens[dataStart] || null;
+
+    let volumeIdx = -1;
+    for (let i = dataStart + 1; i < Math.min(tokens.length, dataStart + 8); i += 1) {
+      const n = parseNumber(tokens[i]);
+      if (Number.isFinite(n) && n > 0) {
+        volumeIdx = i;
+        break;
+      }
+    }
+    if (volumeIdx < 0) continue;
+    const volume_liters = parseNumber(tokens[volumeIdx]);
     if (!Number.isFinite(volume_liters)) continue;
 
-    const amountToken = tokens[dateIdx + afterTimeOffset + 2];
-    const amount = parseNumber(amountToken);
-    const document_number = tokens[dateIdx + afterTimeOffset + 3] || null;
-    const location = tokens.slice(dateIdx + afterTimeOffset + 4).join(" ").trim() || null;
+    let amountIdx = -1;
+    for (let i = volumeIdx + 1; i < Math.min(tokens.length, volumeIdx + 8); i += 1) {
+      const n = parseNumber(tokens[i]);
+      if (Number.isFinite(n) && n >= 0) {
+        amountIdx = i;
+        break;
+      }
+    }
+    const amount = amountIdx >= 0 ? parseNumber(tokens[amountIdx]) : null;
 
-    const numericExtras = tokens
-      .map((token) => parseNumber(token))
-      .filter((value) => Number.isFinite(value));
+    const docIdx = amountIdx >= 0 ? amountIdx + 1 : volumeIdx + 1;
+    const document_number = tokens[docIdx] || null;
+    const location = tokens.slice(docIdx + 1).join(" ").trim() || null;
+    const driver_name = tokens.slice(cardIdx + 1, dateIdx).join(" ").trim() || null;
+
+    const numericExtras = tokens.map((token) => parseNumber(token)).filter((value) => Number.isFinite(value));
 
     parsed.push({
       card_number,
@@ -714,6 +747,45 @@ const parsePdfTransactionLines = (text) => {
         raw_line: line,
       },
     });
+  }
+
+  if (parsed.length > 0) return parsed;
+
+  // Fallback for PDFs where row text is not split line-by-line predictably.
+  const compactText = lines.join("\n");
+  const rowRegex =
+    /(\d{4,})\s+([A-Za-z][A-Za-z .'-]{0,50})?\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{1,2}-[A-Za-z]{3}-\d{4})\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)\s+([A-Za-z0-9-]{1,20})\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+([A-Za-z0-9-]{2,40})\s+([^\n]+)/gi;
+  let match = rowRegex.exec(compactText);
+  while (match) {
+    const card_number = String(match[1] || "").replace(/\D/g, "");
+    const driver_name = String(match[2] || "").trim() || null;
+    const purchase_datetime = parseDateTime(`${match[3]} ${match[4]}`);
+    const product = match[5] || null;
+    const volume_liters = parseNumber(match[6]);
+    const amount = parseNumber(match[7]);
+    const document_number = match[8] || null;
+    const location = String(match[9] || "").trim() || null;
+
+    if (card_number.length >= 4 && purchase_datetime && Number.isFinite(volume_liters)) {
+      parsed.push({
+        card_number,
+        driver_name,
+        purchase_datetime,
+        location,
+        city: null,
+        province: extractProvince(location),
+        document_number,
+        product,
+        volume_liters,
+        amount: Number.isFinite(amount) ? amount : null,
+        source_raw_json: {
+          amount: Number.isFinite(amount) ? amount : null,
+          raw_line: match[0],
+          parser_mode: "regex-fallback",
+        },
+      });
+    }
+    match = rowRegex.exec(compactText);
   }
 
   return parsed;
@@ -927,6 +999,38 @@ router.post(
         const fileBuffer = fs.readFileSync(file.path);
         const parsedPdf = await pdf(fileBuffer);
         const rows = parsePdfTransactionLines(parsedPdf.text);
+        const previewLines = String(parsedPdf.text || "")
+          .split(/\r?\n/)
+          .map((line) => String(line || "").trim())
+          .filter(Boolean)
+          .slice(0, 12);
+
+        if (rows.length === 0) {
+          const parseError = `No transaction rows matched parser. text_length=${String(parsedPdf.text || "").length}`;
+          await client.query(
+            `UPDATE transaction_uploads
+             SET parse_status = 'failed',
+                 parse_error = $2,
+                 rows_inserted = 0,
+                 rows_skipped = 0,
+                 rows_unmatched = 0
+             WHERE id = $1`,
+            [uploadId, parseError]
+          );
+
+          summary.push({
+            upload_id: uploadId,
+            original_filename: file.originalname,
+            parsed_rows: 0,
+            rows_inserted: 0,
+            rows_skipped: 0,
+            rows_unmatched: 0,
+            parse_status: "failed",
+            parse_error: parseError,
+            preview_lines: previewLines,
+          });
+          continue;
+        }
 
         let inserted = 0;
         let skipped = 0;
