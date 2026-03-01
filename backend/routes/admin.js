@@ -56,8 +56,58 @@ const parseNumber = (value) => {
 const parseDateTime = (value) => {
   if (!value) return null;
   if (value instanceof Date) return value;
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const direct = new Date(raw);
+  if (!Number.isNaN(direct.getTime())) return direct;
+
+  const normalized = raw.replace(/\./g, "/").replace(/\s+/g, " ");
+  const match = normalized.match(
+    /^(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})(?:\s+(\d{1,2}:\d{2}(?::\d{2})?)(?:\s*([AP]M))?)?$/i
+  );
+  if (!match) return null;
+
+  let a = parseInt(match[1], 10);
+  let b = parseInt(match[2], 10);
+  let c = parseInt(match[3], 10);
+  const timePart = match[4] || "00:00:00";
+  const ampm = String(match[5] || "").toUpperCase();
+
+  let year;
+  let month;
+  let day;
+  if (String(match[1]).length === 4) {
+    year = a;
+    month = b;
+    day = c;
+  } else if (String(match[3]).length === 4) {
+    year = c;
+    if (a > 12 && b <= 12) {
+      day = a;
+      month = b;
+    } else if (b > 12 && a <= 12) {
+      month = a;
+      day = b;
+    } else {
+      month = a;
+      day = b;
+    }
+  } else {
+    return null;
+  }
+
+  const timeMatch = timePart.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!timeMatch) return null;
+  let hours = parseInt(timeMatch[1], 10);
+  const minutes = parseInt(timeMatch[2], 10);
+  const seconds = parseInt(timeMatch[3] || "0", 10);
+  if (ampm === "PM" && hours < 12) hours += 12;
+  if (ampm === "AM" && hours === 12) hours = 0;
+
+  const parsed = new Date(year, month - 1, day, hours, minutes, seconds);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 };
 
 const formatDateOnly = (value) => {
@@ -152,6 +202,395 @@ const ensureCardsHistorySchemaCompat = async (client) => {
     END $$;
   `);
 };
+
+const ensureGeneratedInvoicesSchemaCompat = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_invoices (
+      id bigserial PRIMARY KEY,
+      customer_id int NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      invoice_no text NOT NULL,
+      invoice_date date NOT NULL DEFAULT CURRENT_DATE,
+      period_start date,
+      period_end date,
+      subtotal numeric(12,2) NOT NULL DEFAULT 0,
+      gst numeric(12,2) NOT NULL DEFAULT 0,
+      hst numeric(12,2) NOT NULL DEFAULT 0,
+      pst numeric(12,2) NOT NULL DEFAULT 0,
+      qst numeric(12,2) NOT NULL DEFAULT 0,
+      total numeric(12,2) NOT NULL DEFAULT 0,
+      totals_provided boolean NOT NULL DEFAULT false,
+      status text NOT NULL DEFAULT 'issued',
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'uq_customer_invoices_customer_invoice_no'
+      ) THEN
+        ALTER TABLE customer_invoices
+          ADD CONSTRAINT uq_customer_invoices_customer_invoice_no UNIQUE (customer_id, invoice_no);
+      END IF;
+    END $$;
+  `);
+};
+
+const parseDateOnly = (value) => {
+  if (!value) return null;
+  const parsed = new Date(String(value).trim());
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+};
+
+const ensureInvoiceBatchPhase1Schema = async () => {
+  await pool.query(`
+    ALTER TABLE transactions
+      ADD COLUMN IF NOT EXISTS is_invoiced BOOLEAN NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS invoice_batch_id BIGINT NULL,
+      ADD COLUMN IF NOT EXISTS invoice_id BIGINT NULL
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS invoice_batches (
+      id BIGSERIAL PRIMARY KEY,
+      batch_code TEXT UNIQUE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'DRAFT',
+      date_from DATE,
+      date_to DATE,
+      created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS invoice_batch_transactions (
+      id BIGSERIAL PRIMARY KEY,
+      invoice_batch_id BIGINT NOT NULL REFERENCES invoice_batches(id) ON DELETE CASCADE,
+      transaction_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+      customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+      line_status TEXT NOT NULL DEFAULT 'PENDING',
+      issue_note TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (invoice_batch_id, transaction_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_invoice_batches_status
+      ON invoice_batches (status, created_at DESC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_invoice_batch_transactions_batch
+      ON invoice_batch_transactions (invoice_batch_id, line_status)
+  `);
+};
+
+const makeBatchCode = () => {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const seq = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
+  return `BATCH-${y}${m}${day}-${seq}`;
+};
+
+const findCustomersMissingRateGroupForRange = async ({ customerId, dateFrom, dateTo }) => {
+  const values = [dateFrom, dateTo];
+  let customerFilter = "";
+  if (customerId) {
+    values.push(customerId);
+    customerFilter = `AND t.customer_id = $${values.length}`;
+  }
+
+  const assignmentsExistsResult = await pool.query(
+    `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
+  );
+  const hasAssignmentsTable = !!assignmentsExistsResult.rows[0]?.exists;
+
+  const query = hasAssignmentsTable
+    ? `
+      SELECT DISTINCT
+        c.id AS customer_id,
+        c.customer_number,
+        c.company_name
+      FROM transactions t
+      JOIN customers c ON c.id = t.customer_id
+      LEFT JOIN LATERAL (
+        SELECT crga.rate_group_id
+        FROM customer_rate_group_assignments crga
+        WHERE crga.customer_id = t.customer_id
+          AND crga.start_date <= COALESCE(t.purchase_datetime::date, CURRENT_DATE)
+          AND (crga.end_date IS NULL OR crga.end_date >= COALESCE(t.purchase_datetime::date, CURRENT_DATE))
+        ORDER BY crga.start_date DESC, crga.id DESC
+        LIMIT 1
+      ) cra ON TRUE
+      WHERE t.purchase_datetime >= $1
+        AND t.purchase_datetime <= $2
+        ${customerFilter}
+        AND COALESCE(cra.rate_group_id, c.rate_group_id) IS NULL
+      ORDER BY c.company_name ASC NULLS LAST, c.id ASC
+    `
+    : `
+      SELECT DISTINCT
+        c.id AS customer_id,
+        c.customer_number,
+        c.company_name
+      FROM transactions t
+      JOIN customers c ON c.id = t.customer_id
+      WHERE t.purchase_datetime >= $1
+        AND t.purchase_datetime <= $2
+        ${customerFilter}
+        AND c.rate_group_id IS NULL
+      ORDER BY c.company_name ASC NULLS LAST, c.id ASC
+    `;
+
+  const result = await pool.query(query, values);
+  return result.rows;
+};
+
+const normalizeKey = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+const ensureInvoiceBatchPhase2Schema = async () => {
+  await ensureInvoiceBatchPhase1Schema();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS customer_markup_rules (
+      id BIGSERIAL PRIMARY KEY,
+      customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+      product TEXT,
+      province TEXT,
+      site TEXT,
+      markup_type TEXT NOT NULL CHECK (markup_type IN ('per_liter', 'percent')),
+      markup_value NUMERIC(12,6) NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 100,
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      effective_from DATE,
+      effective_to DATE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE invoice_batches
+      ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS reviewed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+  `);
+
+  await pool.query(`
+    ALTER TABLE invoice_batch_transactions
+      ADD COLUMN IF NOT EXISTS rate_group_id INTEGER,
+      ADD COLUMN IF NOT EXISTS rate_group_name TEXT,
+      ADD COLUMN IF NOT EXISTS rate_source_effective_date DATE,
+      ADD COLUMN IF NOT EXISTS base_rate NUMERIC(12,6),
+      ADD COLUMN IF NOT EXISTS markup_rule_id BIGINT,
+      ADD COLUMN IF NOT EXISTS markup_rule_used TEXT,
+      ADD COLUMN IF NOT EXISTS markup_type TEXT,
+      ADD COLUMN IF NOT EXISTS markup_value NUMERIC(12,6),
+      ADD COLUMN IF NOT EXISTS rate_per_ltr NUMERIC(12,6),
+      ADD COLUMN IF NOT EXISTS subtotal NUMERIC(14,4),
+      ADD COLUMN IF NOT EXISTS gst NUMERIC(14,4),
+      ADD COLUMN IF NOT EXISTS pst NUMERIC(14,4),
+      ADD COLUMN IF NOT EXISTS qst NUMERIC(14,4),
+      ADD COLUMN IF NOT EXISTS amount_total NUMERIC(14,4),
+      ADD COLUMN IF NOT EXISTS flags TEXT[] DEFAULT ARRAY[]::TEXT[]
+  `);
+};
+
+const ensureInvoiceNumberSequenceSchema = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS invoice_number_sequences (
+      month_key CHAR(6) PRIMARY KEY,
+      last_seq INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  await pool.query(`ALTER TABLE customer_invoices ADD COLUMN IF NOT EXISTS due_date DATE`);
+};
+
+const generateInvoiceNo = async (client, invoiceDate) => {
+  const d = invoiceDate ? new Date(invoiceDate) : new Date();
+  if (Number.isNaN(d.getTime())) {
+    throw new Error("Invalid invoice date");
+  }
+  const monthKey = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
+
+  const result = await client.query(
+    `INSERT INTO invoice_number_sequences (month_key, last_seq)
+     VALUES ($1, 1)
+     ON CONFLICT (month_key)
+     DO UPDATE SET last_seq = invoice_number_sequences.last_seq + 1, updated_at = now()
+     RETURNING last_seq`,
+    [monthKey]
+  );
+
+  const seq = result.rows[0]?.last_seq || 1;
+  return `FL-${monthKey}-${String(seq).padStart(4, "0")}`;
+};
+
+const getEffectiveRateGroupForTx = async (client, customerId, txDate) => {
+  const rateGroupColumns = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema='public' AND table_name='rate_groups'`
+  );
+  const rateGroupColumnSet = new Set(rateGroupColumns.rows.map((r) => r.column_name));
+  const readyExpr = rateGroupColumnSet.has("is_ready")
+    ? "COALESCE(rg.is_ready, true)"
+    : "true";
+
+  const hasAssignmentsResult = await client.query(
+    `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
+  );
+  const hasAssignments = !!hasAssignmentsResult.rows[0]?.exists;
+
+  if (hasAssignments) {
+    const result = await client.query(
+      `SELECT
+         COALESCE(cra.rate_group_id, c.rate_group_id) AS rate_group_id,
+         rg.name AS rate_group_name,
+         rg.markup_per_liter,
+         ${readyExpr} AS is_ready
+       FROM customers c
+       LEFT JOIN LATERAL (
+         SELECT crga.rate_group_id
+         FROM customer_rate_group_assignments crga
+         WHERE crga.customer_id = c.id
+           AND crga.start_date <= $2::date
+           AND (crga.end_date IS NULL OR crga.end_date >= $2::date)
+         ORDER BY crga.start_date DESC, crga.id DESC
+         LIMIT 1
+       ) cra ON TRUE
+       LEFT JOIN rate_groups rg ON rg.id = COALESCE(cra.rate_group_id, c.rate_group_id)
+       WHERE c.id = $1
+       LIMIT 1`,
+      [customerId, txDate]
+    );
+    return result.rows[0] || null;
+  }
+
+  const fallback = await client.query(
+    `SELECT c.rate_group_id, rg.name AS rate_group_name, rg.markup_per_liter, true AS is_ready
+     FROM customers c
+     LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
+     WHERE c.id = $1
+     LIMIT 1`,
+    [customerId]
+  );
+  return fallback.rows[0] || null;
+};
+
+const getTaxRatesForTx = async (client, province, txDateTime) => {
+  const hasTaxTable = await client.query(
+    `SELECT to_regclass('public.tax_rules') IS NOT NULL AS exists`
+  );
+  if (!hasTaxTable.rows[0]?.exists) {
+    return { gst_rate: 0, pst_rate: 0, qst_rate: 0 };
+  }
+  const result = await client.query(
+    `SELECT COALESCE(gst_rate,0) AS gst_rate, COALESCE(pst_rate,0) AS pst_rate, COALESCE(qst_rate,0) AS qst_rate
+     FROM tax_rules
+     WHERE province = $1
+       AND effective_from <= $2
+     ORDER BY effective_from DESC
+     LIMIT 1`,
+    [String(province || "").toUpperCase(), txDateTime]
+  );
+  return result.rows[0] || { gst_rate: 0, pst_rate: 0, qst_rate: 0 };
+};
+
+const findBestMarkupRule = async (client, { customerId, product, province, location, txDate, fallbackMarkup }) => {
+  const rulesResult = await client.query(
+    `SELECT id, customer_id, product, province, site, markup_type, markup_value, priority
+     FROM customer_markup_rules
+     WHERE customer_id = $1
+       AND is_active = true
+       AND (effective_from IS NULL OR effective_from <= $2::date)
+       AND (effective_to IS NULL OR effective_to >= $2::date)
+     ORDER BY priority ASC, id DESC`,
+    [customerId, txDate]
+  );
+
+  const txProduct = normalizeKey(product);
+  const txProvince = normalizeKey(province);
+  const txSite = normalizeKey(location);
+
+  const scored = rulesResult.rows
+    .map((rule) => {
+      const ruleSite = normalizeKey(rule.site);
+      const ruleProduct = normalizeKey(rule.product);
+      const ruleProvince = normalizeKey(rule.province);
+      const siteMatch = !ruleSite || ruleSite === txSite;
+      const productMatch = !ruleProduct || ruleProduct === txProduct;
+      const provinceMatch = !ruleProvince || ruleProvince === txProvince;
+      if (!siteMatch || !productMatch || !provinceMatch) return null;
+
+      let specificity = 0;
+      if (ruleSite && ruleProduct) specificity = 600;
+      else if (ruleSite) specificity = 500;
+      else if (ruleProvince && ruleProduct) specificity = 400;
+      else if (ruleProvince) specificity = 300;
+      else if (ruleProduct) specificity = 200;
+      else specificity = 100;
+
+      return { ...rule, specificity };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (b.specificity !== a.specificity) return b.specificity - a.specificity;
+      if ((a.priority || 0) !== (b.priority || 0)) return (a.priority || 0) - (b.priority || 0);
+      return (b.id || 0) - (a.id || 0);
+    });
+
+  if (scored.length > 0) {
+    return {
+      markup_rule_id: scored[0].id,
+      markup_rule_used: "CUSTOMER_MARKUP_RULE",
+      markup_type: scored[0].markup_type,
+      markup_value: Number(scored[0].markup_value) || 0,
+    };
+  }
+
+  if (Number.isFinite(Number(fallbackMarkup))) {
+    return {
+      markup_rule_id: null,
+      markup_rule_used: "RATE_GROUP_FALLBACK",
+      markup_type: "per_liter",
+      markup_value: Number(fallbackMarkup) || 0,
+    };
+  }
+
+  return null;
+};
+
+const getBaseRateForTx = async (client, { txDate, location, province }) => {
+  const result = await client.query(
+    `SELECT rl.base_price, rf.effective_date
+     FROM rates_lines rl
+     JOIN rates_files rf ON rf.id = rl.rates_file_id
+     WHERE COALESCE(rf.customer_id, 0) = 0
+       AND rf.effective_date <= $1::date
+       AND COALESCE(rl.base_price, 0) > 0
+       AND (
+         regexp_replace(lower(COALESCE(rl.site_name,'')), '[^a-z0-9]+', '', 'g') =
+         regexp_replace(lower(COALESCE($2,'')), '[^a-z0-9]+', '', 'g')
+         OR (
+           COALESCE($3,'') <> '' AND upper(COALESCE(rl.province,'')) = upper($3)
+         )
+       )
+     ORDER BY rf.effective_date DESC, rl.id DESC
+     LIMIT 1`,
+    [txDate, location, province]
+  );
+  return result.rows[0] || null;
+};
 const resolveCustomerId = async (customer_id, customer_number) => {
   const customerNumber = String(customer_number || "").trim();
   if (customerNumber) {
@@ -209,34 +648,40 @@ const parsePdfTransactionLines = (text) => {
 
   for (const rawLine of lines) {
     const line = String(rawLine || "").trim();
-    if (!/^\d{4,}/.test(line)) continue;
+    if (!line) continue;
 
     const tokens = line.split(/\s+/).filter(Boolean);
-    if (tokens.length < 7) continue;
+    if (tokens.length < 8) continue;
 
-    const card_number = tokens[0];
+    const firstTokenDigits = String(tokens[0] || "").replace(/\D/g, "");
+    if (firstTokenDigits.length < 4) continue;
+    const card_number = firstTokenDigits;
+
     const dateIdx = tokens.findIndex((token, idx) => idx > 0 && (
-      /^\d{4}[/-]\d{2}[/-]\d{2}$/.test(token) ||
-      /^\d{2}[/-]\d{2}[/-]\d{4}$/.test(token)
+      /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/.test(token) ||
+      /^\d{1,2}[/-]\d{1,2}[/-]\d{4}$/.test(token)
     ));
     if (dateIdx < 0 || dateIdx + 3 >= tokens.length) continue;
 
     const timeToken = tokens[dateIdx + 1];
-    if (!/^\d{2}:\d{2}(:\d{2})?$/.test(timeToken)) continue;
+    const ampmToken = /^[AP]M$/i.test(tokens[dateIdx + 2] || "") ? tokens[dateIdx + 2] : "";
+    const afterTimeOffset = ampmToken ? 3 : 2;
 
     const driver_name = tokens.slice(1, dateIdx).join(" ").trim() || null;
-    const dateToken = tokens[dateIdx].replace(/\//g, "-");
-    const purchase_datetime = parseDateTime(`${dateToken} ${timeToken}`);
+    const dateToken = tokens[dateIdx];
+    const purchase_datetime = parseDateTime(
+      `${dateToken} ${timeToken}${ampmToken ? ` ${ampmToken}` : ""}`.trim()
+    );
     if (!purchase_datetime) continue;
 
-    const product = tokens[dateIdx + 2] || null;
-    const volume_liters = parseNumber(tokens[dateIdx + 3]);
+    const product = tokens[dateIdx + afterTimeOffset] || null;
+    const volume_liters = parseNumber(tokens[dateIdx + afterTimeOffset + 1]);
     if (!Number.isFinite(volume_liters)) continue;
 
-    const amountToken = tokens[dateIdx + 4];
+    const amountToken = tokens[dateIdx + afterTimeOffset + 2];
     const amount = parseNumber(amountToken);
-    const document_number = tokens[dateIdx + 5] || null;
-    const location = tokens.slice(dateIdx + 6).join(" ").trim() || null;
+    const document_number = tokens[dateIdx + afterTimeOffset + 3] || null;
+    const location = tokens.slice(dateIdx + afterTimeOffset + 4).join(" ").trim() || null;
 
     const numericExtras = tokens
       .map((token) => parseNumber(token))
@@ -262,6 +707,38 @@ const parsePdfTransactionLines = (text) => {
   }
 
   return parsed;
+};
+
+const resolveCustomerIdByCard = async (client, rawCardNumber) => {
+  const raw = String(rawCardNumber || "").trim();
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, "");
+  const last4 = digits.length >= 4 ? digits.slice(-4) : "";
+
+  const result = await client.query(
+    `SELECT customer_id
+     FROM cards
+     WHERE customer_id IS NOT NULL
+       AND (
+         card_number = $1
+         OR regexp_replace(card_number, '\\D', '', 'g') = $2
+         OR ($3 <> '' AND right(regexp_replace(card_number, '\\D', '', 'g'), 4) = $3)
+       )
+     ORDER BY
+       CASE
+         WHEN card_number = $1 THEN 0
+         WHEN regexp_replace(card_number, '\\D', '', 'g') = $2 THEN 1
+         ELSE 2
+       END,
+       id DESC
+     LIMIT 10`,
+    [raw, digits, last4]
+  );
+
+  if (!result.rows.length) return null;
+  const uniqueCustomers = [...new Set(result.rows.map((r) => r.customer_id).filter(Boolean))];
+  if (uniqueCustomers.length !== 1) return null;
+  return uniqueCustomers[0];
 };
 
 
@@ -449,11 +926,7 @@ router.post(
 
         for (const row of rows) {
           try {
-            const cardCustomer = await client.query(
-              "SELECT customer_id FROM cards WHERE card_number = $1 LIMIT 1",
-              [row.card_number]
-            );
-            const customerId = cardCustomer.rows[0]?.customer_id || null;
+            const customerId = await resolveCustomerIdByCard(client, row.card_number);
             if (!customerId) {
               unmatched += 1;
             }
@@ -2331,6 +2804,1216 @@ router.get("/cards", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("Admin cards list error:", err);
     return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.get("/transactions/raw", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const {
+      date_from,
+      date_to,
+      customer_id,
+      card_number,
+      page = "1",
+      pageSize = "50",
+    } = req.query || {};
+
+    const pageNum = parseInt(page, 10);
+    const pageSizeNum = parseInt(pageSize, 10);
+    if (!Number.isInteger(pageNum) || pageNum < 1) {
+      return res.status(400).json({ message: "Invalid page" });
+    }
+    if (!Number.isInteger(pageSizeNum) || pageSizeNum < 1 || pageSizeNum > 500) {
+      return res.status(400).json({ message: "Invalid pageSize" });
+    }
+
+    const values = [];
+    const where = [];
+
+    if (date_from) {
+      values.push(date_from);
+      where.push(`t.purchase_datetime >= $${values.length}`);
+    }
+    if (date_to) {
+      values.push(date_to);
+      where.push(`t.purchase_datetime <= $${values.length}`);
+    }
+    if (customer_id) {
+      const customerIdNum = parseInt(customer_id, 10);
+      if (!Number.isInteger(customerIdNum) || customerIdNum < 1) {
+        return res.status(400).json({ message: "Invalid customer_id" });
+      }
+      values.push(customerIdNum);
+      where.push(`t.customer_id = $${values.length}`);
+    }
+    if (card_number) {
+      values.push(String(card_number).trim());
+      where.push(`t.card_number = $${values.length}`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const totalsResult = await pool.query(
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         ) t.id, t.volume_liters, t.total_amount
+         FROM transactions t
+         ${whereSql}
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT
+         COUNT(*)::int AS count,
+         COALESCE(SUM(volume_liters), 0) AS total_litres,
+         COALESCE(SUM(total_amount), 0) AS total_amount
+       FROM deduped`,
+      values
+    );
+
+    const offset = (pageNum - 1) * pageSizeNum;
+    const dataResult = await pool.query(
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         )
+           t.*,
+           c.customer_number,
+           c.company_name
+         FROM transactions t
+         LEFT JOIN customers c ON c.id = t.customer_id
+         ${whereSql}
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT *
+       FROM deduped
+       ORDER BY purchase_datetime DESC NULLS LAST, id DESC
+       LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      values.concat([pageSizeNum, offset])
+    );
+
+    const rawColumns = new Set();
+    const rows = dataResult.rows.map((row) => {
+      const raw = row?.source_raw_json && typeof row.source_raw_json === "object" ? row.source_raw_json : {};
+      Object.keys(raw).forEach((key) => {
+        if (key && key !== "raw_line") rawColumns.add(key);
+      });
+      return row;
+    });
+
+    return res.json({
+      data: rows,
+      raw_columns: Array.from(rawColumns),
+      totals: totalsResult.rows[0] || { count: 0, total_litres: 0, total_amount: 0 },
+      page: pageNum,
+      pageSize: pageSizeNum,
+    });
+  } catch (err) {
+    console.error("Admin raw transactions error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const {
+      date_from,
+      date_to,
+      customer_id,
+      page = "1",
+      pageSize = "50",
+    } = req.query || {};
+
+    const pageNum = parseInt(page, 10);
+    const pageSizeNum = parseInt(pageSize, 10);
+    if (!Number.isInteger(pageNum) || pageNum < 1) {
+      return res.status(400).json({ message: "Invalid page" });
+    }
+    if (!Number.isInteger(pageSizeNum) || pageSizeNum < 1 || pageSizeNum > 500) {
+      return res.status(400).json({ message: "Invalid pageSize" });
+    }
+
+    const values = [];
+    const where = [];
+    if (date_from) {
+      values.push(date_from);
+      where.push(`t.purchase_datetime >= $${values.length}`);
+    }
+    if (date_to) {
+      values.push(date_to);
+      where.push(`t.purchase_datetime <= $${values.length}`);
+    }
+    if (customer_id) {
+      const customerIdNum = parseInt(customer_id, 10);
+      if (!Number.isInteger(customerIdNum) || customerIdNum < 1) {
+        return res.status(400).json({ message: "Invalid customer_id" });
+      }
+      values.push(customerIdNum);
+      where.push(`t.customer_id = $${values.length}`);
+    }
+
+    if (date_from && date_to) {
+      const blockedCustomers = await findCustomersMissingRateGroupForRange({
+        customerId: customer_id ? parseInt(customer_id, 10) : null,
+        dateFrom: date_from,
+        dateTo: date_to,
+      });
+      if (blockedCustomers.length > 0) {
+        return res.status(409).json({
+          message: "Rate group assignment is required for all customers before processing.",
+          blocked_customers: blockedCustomers,
+        });
+      }
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const assignmentsExistsResult = await pool.query(
+      `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
+    );
+    const hasAssignmentsTable = !!assignmentsExistsResult.rows[0]?.exists;
+    const rateJoinSql = hasAssignmentsTable
+      ? `LEFT JOIN LATERAL (
+           SELECT crga.rate_group_id
+           FROM customer_rate_group_assignments crga
+           WHERE crga.customer_id = t.customer_id
+             AND crga.start_date <= COALESCE(t.purchase_datetime::date, CURRENT_DATE)
+             AND (crga.end_date IS NULL OR crga.end_date >= COALESCE(t.purchase_datetime::date, CURRENT_DATE))
+           ORDER BY crga.start_date DESC, crga.id DESC
+           LIMIT 1
+         ) cra ON TRUE
+         LEFT JOIN rate_groups rg ON rg.id = COALESCE(cra.rate_group_id, c.rate_group_id)`
+      : `LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id`;
+
+    const totalsResult = await pool.query(
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         )
+           t.*,
+           c.customer_number,
+           c.company_name,
+           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+         FROM transactions t
+         JOIN customers c ON c.id = t.customer_id
+         ${rateJoinSql}
+         ${whereSql}
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT
+         COUNT(*)::int AS count,
+         COALESCE(SUM(volume_liters), 0) AS total_litres,
+         COALESCE(SUM(
+           COALESCE(
+             total,
+             total_amount,
+             COALESCE(
+               subtotal,
+               COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
+             ) + COALESCE(gst, 0) + COALESCE(pst, 0) + COALESCE(qst, 0)
+           )
+         ), 0) AS total_amount
+       FROM deduped`,
+      values
+    );
+
+    const offset = (pageNum - 1) * pageSizeNum;
+    const dataResult = await pool.query(
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         )
+           t.*,
+           c.customer_number,
+           c.company_name,
+           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+         FROM transactions t
+         JOIN customers c ON c.id = t.customer_id
+         ${rateJoinSql}
+         ${whereSql}
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT
+         id,
+         customer_id,
+         customer_number,
+         company_name,
+         purchase_datetime,
+         card_number,
+         document_number,
+         location,
+         COALESCE(province, '') AS province,
+         product,
+         volume_liters,
+         COALESCE(
+           computed_rate_per_liter,
+           CASE
+             WHEN COALESCE(volume_liters, 0) > 0 THEN ROUND(
+               (COALESCE(subtotal, total, total_amount, 0) / volume_liters) + COALESCE(effective_markup_per_liter, 0),
+               4
+             )
+             ELSE NULL
+           END
+         ) AS computed_rate_per_liter,
+         COALESCE(
+           subtotal,
+           COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
+         ) AS subtotal,
+         COALESCE(gst, 0) AS gst,
+         COALESCE(pst, 0) AS pst,
+         COALESCE(qst, 0) AS qst,
+         COALESCE(
+           total,
+           total_amount,
+           COALESCE(
+             subtotal,
+             COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
+           ) + COALESCE(gst, 0) + COALESCE(pst, 0) + COALESCE(qst, 0)
+         ) AS total
+       FROM deduped
+       ORDER BY purchase_datetime DESC NULLS LAST, id DESC
+       LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      values.concat([pageSizeNum, offset])
+    );
+
+    return res.json({
+      data: dataResult.rows,
+      totals: totalsResult.rows[0] || { count: 0, total_litres: 0, total_amount: 0 },
+      page: pageNum,
+      pageSize: pageSizeNum,
+    });
+  } catch (err) {
+    console.error("Admin customer-transactions-view error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.post("/customer-transactions-view/invoice", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureGeneratedInvoicesSchemaCompat();
+
+    const customerIdNum = parseInt(req.body?.customer_id, 10);
+    if (!Number.isInteger(customerIdNum) || customerIdNum < 1) {
+      return res.status(400).json({ message: "Invalid customer_id" });
+    }
+
+    const dateFrom = parseDateOnly(req.body?.date_from);
+    const dateTo = parseDateOnly(req.body?.date_to);
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({ message: "date_from and date_to are required" });
+    }
+
+    const blockedCustomers = await findCustomersMissingRateGroupForRange({
+      customerId: customerIdNum,
+      dateFrom,
+      dateTo,
+    });
+    if (blockedCustomers.length > 0) {
+      return res.status(409).json({
+        message: "Cannot generate invoice until rate group is assigned to customer.",
+        blocked_customers: blockedCustomers,
+      });
+    }
+
+    const assignmentsExistsResult = await pool.query(
+      `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
+    );
+    const hasAssignmentsTable = !!assignmentsExistsResult.rows[0]?.exists;
+    const rateJoinSql = hasAssignmentsTable
+      ? `LEFT JOIN LATERAL (
+           SELECT crga.rate_group_id
+           FROM customer_rate_group_assignments crga
+           WHERE crga.customer_id = t.customer_id
+             AND crga.start_date <= COALESCE(t.purchase_datetime::date, CURRENT_DATE)
+             AND (crga.end_date IS NULL OR crga.end_date >= COALESCE(t.purchase_datetime::date, CURRENT_DATE))
+           ORDER BY crga.start_date DESC, crga.id DESC
+           LIMIT 1
+         ) cra ON TRUE
+         LEFT JOIN rate_groups rg ON rg.id = COALESCE(cra.rate_group_id, c.rate_group_id)`
+      : `LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id`;
+
+    const summaryResult = await pool.query(
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         )
+           t.*,
+           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+         FROM transactions t
+         JOIN customers c ON c.id = t.customer_id
+         ${rateJoinSql}
+         WHERE t.customer_id = $1
+           AND t.purchase_datetime >= $2
+           AND t.purchase_datetime <= $3
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT
+         COUNT(*)::int AS row_count,
+         COALESCE(SUM(volume_liters), 0) AS total_litres,
+         COALESCE(SUM(
+           COALESCE(
+             total,
+             total_amount,
+             COALESCE(
+               subtotal,
+               COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
+             ) + COALESCE(gst, 0) + COALESCE(pst, 0) + COALESCE(qst, 0)
+           )
+         ), 0) AS invoice_total
+       FROM deduped`,
+      [customerIdNum, dateFrom, dateTo]
+    );
+
+    const stats = summaryResult.rows[0] || { row_count: 0, total_litres: 0, invoice_total: 0 };
+    if (Number(stats.row_count) === 0) {
+      return res.status(400).json({ message: "No transactions found in selected date range for this customer" });
+    }
+
+    const generatedNo = `AUTO-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${Math.floor(Math.random() * 1e6)
+      .toString()
+      .padStart(6, "0")}`;
+    const invoiceNo = String(req.body?.invoice_no || "").trim() || generatedNo;
+    const invoiceDate = parseDateOnly(req.body?.invoice_date) || new Date().toISOString().slice(0, 10);
+    const dueDate = parseDateOnly(req.body?.due_date);
+
+    const insertResult = await pool.query(
+      `INSERT INTO customer_invoices
+         (customer_id, invoice_no, invoice_date, period_start, period_end, total, totals_provided, status)
+       VALUES
+         ($1, $2, $3, $4, $5, $6, true, 'issued')
+       ON CONFLICT (customer_id, invoice_no)
+       DO UPDATE SET
+         invoice_date = EXCLUDED.invoice_date,
+         period_start = EXCLUDED.period_start,
+         period_end = EXCLUDED.period_end,
+         total = EXCLUDED.total,
+         totals_provided = true,
+         status = 'issued'
+       RETURNING id, customer_id, invoice_no, invoice_date, period_start, period_end, total, status`,
+      [customerIdNum, invoiceNo, invoiceDate, dateFrom, dateTo, stats.invoice_total]
+    );
+
+    const invoiceRow = insertResult.rows[0];
+    if (dueDate) {
+      try {
+        await pool.query(`ALTER TABLE customer_invoices ADD COLUMN IF NOT EXISTS due_date date`);
+        await pool.query(`UPDATE customer_invoices SET due_date = $1 WHERE id = $2`, [dueDate, invoiceRow.id]);
+      } catch (_err) {}
+    }
+
+    return res.json({
+      message: "Invoice created from customer transaction view",
+      invoice: invoiceRow,
+      stats: {
+        row_count: Number(stats.row_count) || 0,
+        total_litres: Number(stats.total_litres) || 0,
+        invoice_total: Number(stats.invoice_total) || 0,
+      },
+    });
+  } catch (err) {
+    console.error("Create invoice from customer transaction view error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.get("/transactions/uninvoiced", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase1Schema();
+
+    const { date_from, date_to, customer_id, page = "1", pageSize = "100" } = req.query || {};
+    const pageNum = parseInt(page, 10);
+    const pageSizeNum = parseInt(pageSize, 10);
+    if (!Number.isInteger(pageNum) || pageNum < 1) {
+      return res.status(400).json({ message: "Invalid page" });
+    }
+    if (!Number.isInteger(pageSizeNum) || pageSizeNum < 1 || pageSizeNum > 500) {
+      return res.status(400).json({ message: "Invalid pageSize" });
+    }
+
+    const values = [];
+    const where = ["COALESCE(t.is_invoiced, false) = false"];
+
+    if (date_from) {
+      values.push(date_from);
+      where.push(`t.purchase_datetime >= $${values.length}`);
+    }
+    if (date_to) {
+      values.push(date_to);
+      where.push(`t.purchase_datetime <= $${values.length}`);
+    }
+    if (customer_id) {
+      const customerIdNum = parseInt(customer_id, 10);
+      if (!Number.isInteger(customerIdNum) || customerIdNum < 1) {
+        return res.status(400).json({ message: "Invalid customer_id" });
+      }
+      values.push(customerIdNum);
+      where.push(`t.customer_id = $${values.length}`);
+    }
+
+    const whereSql = `WHERE ${where.join(" AND ")}`;
+    const offset = (pageNum - 1) * pageSizeNum;
+
+    const totalsResult = await pool.query(
+      `SELECT
+         COUNT(*)::int AS count,
+         COALESCE(SUM(t.volume_liters), 0) AS total_litres,
+         COALESCE(SUM(COALESCE(t.total, t.total_amount, 0)), 0) AS total_amount
+       FROM transactions t
+       ${whereSql}`,
+      values
+    );
+
+    const rowsResult = await pool.query(
+      `SELECT
+         t.id,
+         t.customer_id,
+         c.customer_number,
+         c.company_name,
+         t.card_number,
+         t.purchase_datetime,
+         t.location,
+         t.province,
+         t.product,
+         t.volume_liters,
+         COALESCE(t.total, t.total_amount, 0) AS total_amount,
+         t.document_number,
+         COALESCE(t.is_invoiced, false) AS is_invoiced,
+         t.invoice_batch_id,
+         t.invoice_id
+       FROM transactions t
+       LEFT JOIN customers c ON c.id = t.customer_id
+       ${whereSql}
+       ORDER BY t.purchase_datetime DESC NULLS LAST, t.id DESC
+       LIMIT $${values.length + 1}
+       OFFSET $${values.length + 2}`,
+      values.concat([pageSizeNum, offset])
+    );
+
+    return res.json({
+      data: rowsResult.rows,
+      totals: totalsResult.rows[0] || { count: 0, total_litres: 0, total_amount: 0 },
+      page: pageNum,
+      pageSize: pageSizeNum,
+    });
+  } catch (err) {
+    console.error("Admin uninvoiced transactions error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.post("/invoice-batches", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase1Schema();
+
+    const inputIds = Array.isArray(req.body?.transaction_ids) ? req.body.transaction_ids : [];
+    const txIds = [...new Set(inputIds.map((id) => parseInt(id, 10)).filter((id) => Number.isInteger(id) && id > 0))];
+    if (txIds.length === 0) {
+      return res.status(400).json({ message: "transaction_ids is required" });
+    }
+
+    await client.query("BEGIN");
+    const txResult = await client.query(
+      `SELECT id, customer_id, purchase_datetime, COALESCE(is_invoiced, false) AS is_invoiced, invoice_batch_id
+       FROM transactions
+       WHERE id = ANY($1::bigint[])
+       ORDER BY id ASC`,
+      [txIds]
+    );
+
+    if (txResult.rows.length !== txIds.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "One or more transaction_ids do not exist" });
+    }
+
+    const alreadyInvoiced = txResult.rows.filter((row) => row.is_invoiced);
+    if (alreadyInvoiced.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        message: "Some transactions are already invoiced",
+        transaction_ids: alreadyInvoiced.map((row) => row.id),
+      });
+    }
+
+    const alreadyBatched = txResult.rows.filter((row) => row.invoice_batch_id);
+    if (alreadyBatched.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        message: "Some transactions already belong to another batch",
+        transaction_ids: alreadyBatched.map((row) => row.id),
+      });
+    }
+
+    const minDate = txResult.rows.reduce((acc, row) => {
+      const d = row.purchase_datetime ? new Date(row.purchase_datetime) : null;
+      return !d || Number.isNaN(d.getTime()) ? acc : (!acc || d < acc ? d : acc);
+    }, null);
+    const maxDate = txResult.rows.reduce((acc, row) => {
+      const d = row.purchase_datetime ? new Date(row.purchase_datetime) : null;
+      return !d || Number.isNaN(d.getTime()) ? acc : (!acc || d > acc ? d : acc);
+    }, null);
+    const dateFrom = minDate ? minDate.toISOString().slice(0, 10) : null;
+    const dateTo = maxDate ? maxDate.toISOString().slice(0, 10) : null;
+
+    const customerIds = [...new Set(txResult.rows.map((row) => row.customer_id).filter((v) => Number.isInteger(v)))];
+    if (customerIds.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Selected transactions must have customer_id" });
+    }
+
+    const blocked = await findCustomersMissingRateGroupForRange({
+      customerId: null,
+      dateFrom: dateFrom || new Date().toISOString().slice(0, 10),
+      dateTo: dateTo || new Date().toISOString().slice(0, 10),
+    });
+    const blockedInSelection = blocked.filter((row) => customerIds.includes(row.customer_id));
+    if (blockedInSelection.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        message: "Rate group assignment is required for all customers in selected transactions.",
+        blocked_customers: blockedInSelection,
+      });
+    }
+
+    const batchCode = makeBatchCode();
+    const batchInsert = await client.query(
+      `INSERT INTO invoice_batches (batch_code, status, date_from, date_to, created_by_user_id)
+       VALUES ($1, 'PROCESSING', $2, $3, $4)
+       RETURNING id, batch_code, status, date_from, date_to, created_at`,
+      [batchCode, dateFrom, dateTo, req.user.id || null]
+    );
+    const batch = batchInsert.rows[0];
+
+    await client.query(
+      `INSERT INTO invoice_batch_transactions (invoice_batch_id, transaction_id, customer_id, line_status)
+       SELECT $1, t.id, t.customer_id, 'READY'
+       FROM transactions t
+       WHERE t.id = ANY($2::bigint[])`,
+      [batch.id, txIds]
+    );
+
+    await client.query(
+      `UPDATE transactions
+       SET invoice_batch_id = $1
+       WHERE id = ANY($2::bigint[])`,
+      [batch.id, txIds]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      message: "Invoice batch created",
+      batch,
+      transaction_count: txIds.length,
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackErr) {}
+    console.error("Create invoice batch error:", err);
+    return res.status(500).json({ message: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.get("/invoice-batches", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase1Schema();
+
+    const result = await pool.query(
+      `SELECT
+         b.id,
+         b.batch_code,
+         b.status,
+         b.date_from,
+         b.date_to,
+         b.created_at,
+         COUNT(ibt.id)::int AS transaction_count,
+         COUNT(DISTINCT ibt.customer_id)::int AS customer_count
+       FROM invoice_batches b
+       LEFT JOIN invoice_batch_transactions ibt ON ibt.invoice_batch_id = b.id
+       GROUP BY b.id
+       ORDER BY b.created_at DESC, b.id DESC`
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("List invoice batches error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase1Schema();
+
+    const batchId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(batchId) || batchId < 1) {
+      return res.status(400).json({ message: "Invalid batch id" });
+    }
+
+    const batchResult = await pool.query(
+      `SELECT id, batch_code, status, date_from, date_to, created_at
+       FROM invoice_batches
+       WHERE id = $1
+       LIMIT 1`,
+      [batchId]
+    );
+    if (batchResult.rows.length === 0) {
+      return res.status(404).json({ message: "Batch not found" });
+    }
+
+    const rowsResult = await pool.query(
+      `SELECT
+         ibt.id AS batch_line_id,
+         ibt.line_status,
+         ibt.issue_note,
+         ibt.rate_group_id,
+         ibt.rate_group_name,
+         ibt.rate_source_effective_date,
+         ibt.base_rate,
+         ibt.markup_rule_id,
+         ibt.markup_rule_used,
+         ibt.markup_type,
+         ibt.markup_value,
+         ibt.rate_per_ltr,
+         ibt.subtotal,
+         ibt.gst,
+         ibt.pst,
+         ibt.qst,
+         ibt.amount_total,
+         ibt.flags,
+         t.id AS transaction_id,
+         t.customer_id,
+         c.customer_number,
+         c.company_name,
+         t.card_number,
+         t.purchase_datetime,
+         t.location,
+         t.province,
+         t.product,
+         t.volume_liters,
+         COALESCE(t.total, t.total_amount, 0) AS total_amount,
+         t.document_number,
+         COALESCE(t.is_invoiced, false) AS is_invoiced
+       FROM invoice_batch_transactions ibt
+       JOIN transactions t ON t.id = ibt.transaction_id
+       LEFT JOIN customers c ON c.id = t.customer_id
+       WHERE ibt.invoice_batch_id = $1
+       ORDER BY t.purchase_datetime DESC NULLS LAST, t.id DESC`,
+      [batchId]
+    );
+
+    const totals = rowsResult.rows.reduce(
+      (acc, row) => {
+        acc.count += 1;
+        acc.total_litres += Number(row.volume_liters) || 0;
+        acc.total_amount += Number(row.total_amount) || 0;
+        return acc;
+      },
+      { count: 0, total_litres: 0, total_amount: 0 }
+    );
+
+    return res.json({
+      batch: batchResult.rows[0],
+      rows: rowsResult.rows,
+      totals,
+    });
+  } catch (err) {
+    console.error("Get invoice batch detail error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase2Schema();
+
+    const batchId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(batchId) || batchId < 1) {
+      return res.status(400).json({ message: "Invalid batch id" });
+    }
+
+    const batchResult = await client.query(
+      `SELECT id, status FROM invoice_batches WHERE id = $1 LIMIT 1`,
+      [batchId]
+    );
+    if (batchResult.rows.length === 0) {
+      return res.status(404).json({ message: "Batch not found" });
+    }
+
+    const rowsResult = await client.query(
+      `SELECT
+         ibt.id AS batch_line_id,
+         t.id AS transaction_id,
+         t.customer_id,
+         t.purchase_datetime,
+         t.location,
+         t.province,
+         t.product,
+         t.volume_liters
+       FROM invoice_batch_transactions ibt
+       JOIN transactions t ON t.id = ibt.transaction_id
+       WHERE ibt.invoice_batch_id = $1
+       ORDER BY t.purchase_datetime ASC NULLS LAST, t.id ASC`,
+      [batchId]
+    );
+
+    if (rowsResult.rows.length === 0) {
+      return res.status(400).json({ message: "Batch has no transactions" });
+    }
+
+    await client.query("BEGIN");
+    let readyCount = 0;
+    let rateMissingCount = 0;
+    let markupMissingCount = 0;
+    let errorCount = 0;
+
+    for (const row of rowsResult.rows) {
+      const flags = [];
+      let lineStatus = "READY";
+      let issueNote = null;
+
+      const txDate = row.purchase_datetime
+        ? new Date(row.purchase_datetime).toISOString().slice(0, 10)
+        : null;
+      const volume = Number(row.volume_liters) || 0;
+
+      let rateGroup = null;
+      let baseRate = null;
+      let markup = null;
+      let finalRate = null;
+      let subtotal = null;
+      let gst = null;
+      let pst = null;
+      let qst = null;
+      let total = null;
+      let effectiveDate = null;
+
+      try {
+        if (!row.customer_id || !txDate) {
+          flags.push("ERROR");
+        } else {
+          rateGroup = await getEffectiveRateGroupForTx(client, row.customer_id, txDate);
+          if (!rateGroup?.rate_group_id || rateGroup?.is_ready === false) {
+            flags.push("RATE_MISSING");
+          }
+
+          baseRate = await getBaseRateForTx(client, {
+            txDate,
+            location: row.location,
+            province: row.province,
+          });
+          if (!baseRate?.base_price) {
+            flags.push("RATE_MISSING");
+          } else {
+            effectiveDate = baseRate.effective_date || null;
+          }
+
+          markup = await findBestMarkupRule(client, {
+            customerId: row.customer_id,
+            product: row.product,
+            province: row.province,
+            location: row.location,
+            txDate,
+            fallbackMarkup: rateGroup?.markup_per_liter,
+          });
+          if (!markup) {
+            flags.push("MARKUP_MISSING");
+          }
+
+          if (flags.length === 0) {
+            const base = Number(baseRate.base_price) || 0;
+            if (markup.markup_type === "percent") {
+              finalRate = round4(base * (1 + (Number(markup.markup_value) || 0) / 100));
+            } else {
+              finalRate = round4(base + (Number(markup.markup_value) || 0));
+            }
+
+            subtotal = round4(volume * (finalRate || 0));
+            const taxes = await getTaxRatesForTx(client, row.province, row.purchase_datetime || txDate);
+            gst = round4((subtotal || 0) * (Number(taxes.gst_rate) || 0));
+            pst = round4((subtotal || 0) * (Number(taxes.pst_rate) || 0));
+            qst = round4((subtotal || 0) * (Number(taxes.qst_rate) || 0));
+            total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
+          }
+        }
+      } catch (err) {
+        flags.push("ERROR");
+        issueNote = err.message || "Calculation error";
+      }
+
+      if (flags.includes("ERROR")) {
+        lineStatus = "ERROR";
+        errorCount += 1;
+      } else if (flags.includes("RATE_MISSING")) {
+        lineStatus = "RATE_MISSING";
+        rateMissingCount += 1;
+      } else if (flags.includes("MARKUP_MISSING")) {
+        lineStatus = "MARKUP_MISSING";
+        markupMissingCount += 1;
+      } else {
+        readyCount += 1;
+      }
+
+      await client.query(
+        `UPDATE invoice_batch_transactions
+         SET
+           line_status = $2,
+           issue_note = $3,
+           rate_group_id = $4,
+           rate_group_name = $5,
+           rate_source_effective_date = $6,
+           base_rate = $7,
+           markup_rule_id = $8,
+           markup_rule_used = $9,
+           markup_type = $10,
+           markup_value = $11,
+           rate_per_ltr = $12,
+           subtotal = $13,
+           gst = $14,
+           pst = $15,
+           qst = $16,
+           amount_total = $17,
+           flags = $18
+         WHERE id = $1`,
+        [
+          row.batch_line_id,
+          lineStatus,
+          issueNote,
+          rateGroup?.rate_group_id || null,
+          rateGroup?.rate_group_name || null,
+          effectiveDate,
+          baseRate?.base_price || null,
+          markup?.markup_rule_id || null,
+          markup?.markup_rule_used || null,
+          markup?.markup_type || null,
+          markup?.markup_value ?? null,
+          finalRate,
+          subtotal,
+          gst,
+          pst,
+          qst,
+          total,
+          flags,
+        ]
+      );
+    }
+
+    await client.query(
+      `UPDATE invoice_batches
+       SET status = 'PROCESSING', updated_at = now()
+       WHERE id = $1`,
+      [batchId]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      message: "Batch recalculated",
+      batch_id: batchId,
+      summary: {
+        total_rows: rowsResult.rows.length,
+        ready: readyCount,
+        rate_missing: rateMissingCount,
+        markup_missing: markupMissingCount,
+        errors: errorCount,
+      },
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackErr) {}
+    console.error("Recalculate batch error:", err);
+    return res.status(500).json({ message: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.post("/invoice-batches/:id/mark-reviewed", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase2Schema();
+
+    const batchId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(batchId) || batchId < 1) {
+      return res.status(400).json({ message: "Invalid batch id" });
+    }
+
+    const invalidRows = await pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM invoice_batch_transactions
+       WHERE invoice_batch_id = $1
+         AND line_status IN ('RATE_MISSING', 'MARKUP_MISSING', 'ERROR')`,
+      [batchId]
+    );
+    if ((invalidRows.rows[0]?.count || 0) > 0) {
+      return res.status(409).json({
+        message: "Cannot mark reviewed until all rows are READY (no RATE_MISSING/MARKUP_MISSING/ERROR).",
+      });
+    }
+
+    const updateResult = await pool.query(
+      `UPDATE invoice_batches
+       SET status = 'REVIEWED',
+           reviewed_at = now(),
+           reviewed_by_user_id = $2,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, batch_code, status, reviewed_at, reviewed_by_user_id`,
+      [batchId, req.user.id || null]
+    );
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ message: "Batch not found" });
+    }
+
+    return res.json({
+      message: "Batch marked as reviewed",
+      batch: updateResult.rows[0],
+    });
+  } catch (err) {
+    console.error("Mark reviewed error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.post("/invoice-batches/:id/generate-invoices", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase2Schema();
+    await ensureGeneratedInvoicesSchemaCompat();
+    await ensureInvoiceNumberSequenceSchema();
+
+    const batchId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(batchId) || batchId < 1) {
+      return res.status(400).json({ message: "Invalid batch id" });
+    }
+
+    const batchResult = await client.query(
+      `SELECT id, batch_code, status, date_from, date_to
+       FROM invoice_batches
+       WHERE id = $1
+       LIMIT 1`,
+      [batchId]
+    );
+    if (batchResult.rows.length === 0) {
+      return res.status(404).json({ message: "Batch not found" });
+    }
+
+    const batch = batchResult.rows[0];
+    if (batch.status !== "REVIEWED") {
+      return res.status(409).json({ message: "Batch must be REVIEWED before invoice generation" });
+    }
+
+    const invalidRows = await client.query(
+      `SELECT COUNT(*)::int AS count
+       FROM invoice_batch_transactions
+       WHERE invoice_batch_id = $1
+         AND line_status IN ('RATE_MISSING', 'MARKUP_MISSING', 'ERROR')`,
+      [batchId]
+    );
+    if ((invalidRows.rows[0]?.count || 0) > 0) {
+      return res.status(409).json({
+        message: "Batch still contains invalid rows. Recalculate and fix flags before generating invoices.",
+      });
+    }
+
+    const alreadyInvoicedRows = await client.query(
+      `SELECT COUNT(*)::int AS count
+       FROM invoice_batch_transactions ibt
+       JOIN transactions t ON t.id = ibt.transaction_id
+       WHERE ibt.invoice_batch_id = $1
+         AND COALESCE(t.is_invoiced, false) = true`,
+      [batchId]
+    );
+    if ((alreadyInvoicedRows.rows[0]?.count || 0) > 0) {
+      return res.status(409).json({
+        message: "Batch has transactions already invoiced. Aborting to prevent duplicates.",
+      });
+    }
+
+    const customerGroups = await client.query(
+      `SELECT
+         ibt.customer_id,
+         MIN(t.purchase_datetime::date) AS period_start,
+         MAX(t.purchase_datetime::date) AS period_end,
+         COUNT(*)::int AS line_count,
+         COALESCE(SUM(COALESCE(ibt.amount_total, t.total, t.total_amount, 0)), 0) AS invoice_total
+       FROM invoice_batch_transactions ibt
+       JOIN transactions t ON t.id = ibt.transaction_id
+       WHERE ibt.invoice_batch_id = $1
+         AND ibt.line_status = 'READY'
+       GROUP BY ibt.customer_id
+       ORDER BY ibt.customer_id ASC`,
+      [batchId]
+    );
+
+    if (customerGroups.rows.length === 0) {
+      return res.status(400).json({ message: "No READY rows in this batch to invoice" });
+    }
+
+    const invoiceDate = parseDateOnly(req.body?.invoice_date) || new Date().toISOString().slice(0, 10);
+    const dueDate = parseDateOnly(req.body?.due_date);
+
+    await client.query("BEGIN");
+
+    const createdInvoices = [];
+    for (const group of customerGroups.rows) {
+      const customerId = parseInt(group.customer_id, 10);
+      if (!Number.isInteger(customerId) || customerId < 1) {
+        continue;
+      }
+
+      const forcedInvoiceNo = String(req.body?.invoice_no_prefix || "").trim();
+      const generatedNo = await generateInvoiceNo(client, invoiceDate);
+      const invoiceNo = forcedInvoiceNo ? `${forcedInvoiceNo}-${generatedNo}` : generatedNo;
+
+      const invoiceInsert = await client.query(
+        `INSERT INTO customer_invoices (
+           customer_id,
+           invoice_no,
+           invoice_date,
+           period_start,
+           period_end,
+           due_date,
+           total,
+           totals_provided,
+           status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true, 'issued')
+         RETURNING id, customer_id, invoice_no, invoice_date, period_start, period_end, due_date, total, status`,
+        [
+          customerId,
+          invoiceNo,
+          invoiceDate,
+          group.period_start || batch.date_from || null,
+          group.period_end || batch.date_to || null,
+          dueDate,
+          Number(group.invoice_total) || 0,
+        ]
+      );
+
+      const invoice = invoiceInsert.rows[0];
+
+      await client.query(
+        `UPDATE transactions t
+         SET
+           is_invoiced = true,
+           invoice_id = $1
+         FROM invoice_batch_transactions ibt
+         WHERE ibt.invoice_batch_id = $2
+           AND ibt.customer_id = $3
+           AND ibt.line_status = 'READY'
+           AND ibt.transaction_id = t.id`,
+        [invoice.id, batchId, customerId]
+      );
+
+      await client.query(
+        `UPDATE invoice_batch_transactions
+         SET line_status = 'INVOICED', issue_note = NULL
+         WHERE invoice_batch_id = $1
+           AND customer_id = $2
+           AND line_status = 'READY'`,
+        [batchId, customerId]
+      );
+
+      createdInvoices.push({
+        ...invoice,
+        line_count: Number(group.line_count) || 0,
+      });
+    }
+
+    await client.query(
+      `UPDATE invoice_batches
+       SET status = 'INVOICED', updated_at = now()
+       WHERE id = $1`,
+      [batchId]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      message: "Invoices generated from batch",
+      batch_id: batchId,
+      invoice_count: createdInvoices.length,
+      invoices: createdInvoices,
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackErr) {}
+    console.error("Generate invoices from batch error:", err);
+    return res.status(500).json({ message: "Server error" });
+  } finally {
+    client.release();
   }
 });
 
