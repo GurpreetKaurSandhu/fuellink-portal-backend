@@ -826,6 +826,91 @@ const parsePdfTransactionLines = (text) => {
 
   if (parsed.length > 0) return parsed;
 
+  // Third attempt for reports where one transaction is wrapped across multiple lines.
+  const blocks = [];
+  let currentBlock = null;
+  for (const line of lines) {
+    if (/^\d{4}\b/.test(line)) {
+      if (currentBlock) blocks.push(currentBlock);
+      currentBlock = line;
+      continue;
+    }
+    if (!currentBlock) continue;
+    if (/^0\d{3}\b/.test(line)) {
+      blocks.push(currentBlock);
+      currentBlock = line;
+      continue;
+    }
+    if (/selection\s*:|product category|page\s*:/i.test(line)) continue;
+    if (/^\(memo\)$/i.test(line)) continue;
+    currentBlock = `${currentBlock} ${line}`.trim();
+  }
+  if (currentBlock) blocks.push(currentBlock);
+
+  const blockDateRegex = /(20\d{2}[/-]\d{2}[/-]\d{2})(?:\s+(\d{2}:\d{2}))?/;
+  const parseBlock = (block) => {
+    const row = String(block || "").replace(/\s+/g, " ").trim();
+    if (!row) return null;
+    const card = row.match(/^(\d{4})\b/);
+    if (!card) return null;
+    const card_number = card[1];
+
+    const dt = row.match(blockDateRegex);
+    if (!dt) return null;
+    const purchase_datetime = parseDateTime(`${dt[1]}${dt[2] ? ` ${dt[2]}` : ""}`);
+    if (!purchase_datetime) return null;
+
+    const left = row.slice(card[0].length, dt.index || 0).trim();
+    const right = row.slice((dt.index || 0) + dt[0].length).trim();
+    const driver_name = cleanDriver(left) || null;
+
+    const productMatch = right.match(/\b(DSL-LS|DEF BULK|DEF|DSL|ULS|GAS|REG|PREM)\b/i);
+    if (!productMatch) return null;
+    const product = String(productMatch[1] || "").trim().toUpperCase();
+
+    const afterProduct = right.slice((productMatch.index || 0) + productMatch[0].length);
+    const nums = afterProduct.match(/\d+\.\d{2}/g) || [];
+    const volume_liters = parseNumber(nums[0]);
+    if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 2000) return null;
+
+    const amount = parseNumber(nums[1] || null);
+
+    // Prefer document number closest to location start (often ending with P)
+    const doc = afterProduct.match(/\b([A-Z0-9]{7,}P?)\b/i);
+    const document_number = doc ? doc[1] : null;
+
+    const locationRaw = String(afterProduct || "")
+      .replace(/\d+\.\d{2}/g, " ")
+      .replace(/\b([A-Z0-9]{7,}P?)\b/i, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const location = locationRaw || null;
+
+    return {
+      card_number,
+      driver_name,
+      purchase_datetime,
+      location,
+      city: null,
+      province: extractProvince(location),
+      document_number,
+      product,
+      volume_liters,
+      amount: Number.isFinite(amount) ? amount : null,
+      source_raw_json: {
+        amount: Number.isFinite(amount) ? amount : null,
+        raw_line: row,
+        parser_mode: "multiline-block",
+      },
+    };
+  };
+
+  for (const block of blocks) {
+    const row = parseBlock(block);
+    if (row) parsed.push(row);
+  }
+  if (parsed.length > 0) return parsed;
+
   // Secondary attempt for compact line formats from Petro-Pass exports.
   for (const line of lines) {
     const row = tryParseCompactLine(line);
@@ -3062,7 +3147,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
     }
     if (date_to) {
       values.push(date_to);
-      where.push(`t.purchase_datetime <= $${values.length}`);
+      where.push(`t.purchase_datetime < ($${values.length}::date + INTERVAL '1 day')`);
     }
     if (customer_id) {
       const customerIdNum = parseInt(customer_id, 10);
@@ -3202,6 +3287,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
 
     const values = [];
     const where = [];
+    const resolvedCustomerExpr = `COALESCE(t.customer_id, cm.customer_id)`;
     if (date_from) {
       values.push(date_from);
       where.push(`t.purchase_datetime >= $${values.length}`);
@@ -3216,7 +3302,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
         return res.status(400).json({ message: "Invalid customer_id" });
       }
       values.push(customerIdNum);
-      where.push(`t.customer_id = $${values.length}`);
+      where.push(`${resolvedCustomerExpr} = $${values.length}`);
     }
 
     if (date_from && date_to) {
@@ -3242,7 +3328,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
       ? `LEFT JOIN LATERAL (
            SELECT crga.rate_group_id
            FROM customer_rate_group_assignments crga
-           WHERE crga.customer_id = t.customer_id
+           WHERE crga.customer_id = ${resolvedCustomerExpr}
              AND crga.start_date <= COALESCE(t.purchase_datetime::date, CURRENT_DATE)
              AND (crga.end_date IS NULL OR crga.end_date >= COALESCE(t.purchase_datetime::date, CURRENT_DATE))
            ORDER BY crga.start_date DESC, crga.id DESC
@@ -3254,7 +3340,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
     const totalsResult = await pool.query(
       `WITH deduped AS (
          SELECT DISTINCT ON (
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3262,15 +3348,25 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            COALESCE(t.total_amount, 0)
          )
            t.*,
+           ${resolvedCustomerExpr} AS resolved_customer_id,
            c.customer_number,
            c.company_name,
            COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
-         JOIN customers c ON c.id = t.customer_id
+         LEFT JOIN LATERAL (
+           SELECT cd.customer_id
+           FROM cards cd
+           WHERE cd.customer_id IS NOT NULL
+             AND regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g') =
+                 regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+           ORDER BY cd.id DESC
+           LIMIT 1
+         ) cm ON TRUE
+         JOIN customers c ON c.id = ${resolvedCustomerExpr}
          ${rateJoinSql}
          ${whereSql}
          ORDER BY
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3299,7 +3395,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
     const dataResult = await pool.query(
       `WITH deduped AS (
          SELECT DISTINCT ON (
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3307,15 +3403,25 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            COALESCE(t.total_amount, 0)
          )
            t.*,
+           ${resolvedCustomerExpr} AS resolved_customer_id,
            c.customer_number,
            c.company_name,
            COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
-         JOIN customers c ON c.id = t.customer_id
+         LEFT JOIN LATERAL (
+           SELECT cd.customer_id
+           FROM cards cd
+           WHERE cd.customer_id IS NOT NULL
+             AND regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g') =
+                 regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+           ORDER BY cd.id DESC
+           LIMIT 1
+         ) cm ON TRUE
+         JOIN customers c ON c.id = ${resolvedCustomerExpr}
          ${rateJoinSql}
          ${whereSql}
          ORDER BY
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3325,7 +3431,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
        )
        SELECT
          id,
-         customer_id,
+         resolved_customer_id AS customer_id,
          customer_number,
          company_name,
          purchase_datetime,
