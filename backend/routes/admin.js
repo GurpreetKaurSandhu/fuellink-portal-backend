@@ -728,6 +728,149 @@ const parsePdfTransactionLines = (text) => {
     /^\d{1,2}:\d{2}(?::\d{2})?$/.test(token) ||
     /^\d{1,2}:\d{2}(?::\d{2})?[AP]M$/i.test(token);
 
+  // Dedicated parser for Petro-Pass "Fuel Pricing Report by Card" PDFs.
+  const tryParseFuelPricingReport = () => {
+    if (!/Fuel Pricing Report by Card/i.test(String(text || ""))) return [];
+
+    const productRegex = /\b(DSL-LS|DEF BULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)\b/i;
+    const provinceDocProductRegex =
+      /^(?:[PR]\s*)?(.*?)(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)(\d{7,}[A-Z]?)(DSL-LS|DEF BULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)(.*)$/i;
+    const amountOnlyRegex = /^\d{1,3}(?:,\d{3})*(?:\.\d{2})$/;
+
+    const parsedFuel = [];
+    let carryCard = "";
+    let carryDriverLines = [];
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = String(lines[i] || "").trim();
+      if (!line) continue;
+
+      if (
+        /Fuel Pricing Report by Card|Selection:|Account:|Page:|Card #Driver Name 1Driver Name 2Date|IN Tax|^\(Memo\)$|^PFT$|^FCT\/PCT$|^Urban$/i.test(
+          line
+        )
+      ) {
+        continue;
+      }
+      if (/^Total for Card\b/i.test(line)) {
+        carryCard = "";
+        carryDriverLines = [];
+        continue;
+      }
+
+      const hasDate = /20\d{2}\/\d{2}\/\d{2}/.test(line);
+      const startsWithCard = /^\d{4,}/.test(line);
+
+      if (startsWithCard && !hasDate) {
+        const m = line.match(/^(\d{4})\d*(.*)$/);
+        carryCard = m?.[1] || "";
+        const rest = String(m?.[2] || "").trim();
+        carryDriverLines = rest ? [rest] : [];
+        continue;
+      }
+
+      if (!hasDate) {
+        // likely continuation driver/location line
+        if (carryCard && line.length <= 40 && !/\d+\.\d{2}/.test(line)) {
+          carryDriverLines.push(line);
+        }
+        continue;
+      }
+
+      let rowLine = line;
+      if (/^20\d{2}\/\d{2}\/\d{2}/.test(line) && carryCard) {
+        rowLine = `${carryCard} ${carryDriverLines.join(" ")} ${line}`.replace(/\s+/g, " ").trim();
+      }
+
+      // Merge wrapped location lines until product appears.
+      let look = i + 1;
+      while (look < lines.length && look <= i + 4 && !productRegex.test(rowLine)) {
+        const next = String(lines[look] || "").trim();
+        if (!next) break;
+        if (/^Total for Card\b|Fuel Pricing Report by Card|Selection:|Account:|Page:/i.test(next)) break;
+        if (/^\d{4,}/.test(next) && /20\d{2}\/\d{2}\/\d{2}/.test(next)) break;
+        if (/^20\d{2}\/\d{2}\/\d{2}/.test(next)) break;
+        rowLine = `${rowLine} ${next}`.replace(/\s+/g, " ").trim();
+        look += 1;
+      }
+
+      const cardMatch = rowLine.match(/^(\d{4})\d*/);
+      const dateMatch = rowLine.match(/(20\d{2}\/\d{2}\/\d{2})/);
+      if (!cardMatch || !dateMatch) continue;
+
+      const card_number = cardMatch[1];
+      const purchase_datetime = parseDateTime(dateMatch[1]);
+      if (!purchase_datetime) continue;
+
+      const left = rowLine.slice(cardMatch[0].length, dateMatch.index || 0).trim();
+      const right = rowLine.slice((dateMatch.index || 0) + dateMatch[0].length).trim();
+      const driver_name = cleanDriver(left).replace(/^\((.*)\)$/, "$1") || null;
+
+      const coreMatch = right.match(provinceDocProductRegex);
+      if (!coreMatch) continue;
+
+      const locationRaw = normalizeLocationForMatch(coreMatch[1] || "");
+      const province = String(coreMatch[2] || "").toUpperCase();
+      const document_number = String(coreMatch[3] || "").trim() || null;
+      const product = String(coreMatch[4] || "").toUpperCase();
+      const numbersRaw = String(coreMatch[5] || "");
+      const numericValues = (numbersRaw.match(/\d+\.\d{2}/g) || []).map((v) => parseNumber(v)).filter((v) => Number.isFinite(v));
+      const volume_liters = numericValues[0];
+      if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 3000) continue;
+
+      // In this report, final Amount is usually on the next line by itself.
+      let amount = null;
+      const nextLine = String(lines[look] || "").trim();
+      if (amountOnlyRegex.test(nextLine)) {
+        amount = parseNumber(nextLine);
+        i = look; // consume the trailing amount line
+      } else {
+        amount = parseNumber(numericValues[numericValues.length - 1] || null);
+      }
+
+      const ex_tax = numericValues[1] ?? null;
+      const fet = numericValues[2] ?? null;
+      const pft = numericValues[3] ?? null;
+      const fct_pct = numericValues[4] ?? null;
+      const urban = numericValues[5] ?? null;
+      const in_tax = numericValues[6] ?? null;
+      const gst_hst = numericValues[7] ?? null;
+      const pst = numericValues[8] ?? null;
+      const amountCandidate = numericValues[9] ?? null;
+
+      parsedFuel.push({
+        card_number,
+        driver_name,
+        purchase_datetime,
+        location: locationRaw || null,
+        city: null,
+        province,
+        document_number,
+        product,
+        volume_liters,
+        amount: Number.isFinite(amount) ? amount : null,
+        source_raw_json: {
+          amount: Number.isFinite(amount) ? amount : (Number.isFinite(amountCandidate) ? amountCandidate : null),
+          ex_tax,
+          fet,
+          pft,
+          fct_pct,
+          urban,
+          in_tax,
+          gst_hst,
+          pst,
+          raw_line: rowLine,
+          parser_mode: "fuel-pricing-report",
+        },
+      });
+    }
+
+    return parsedFuel;
+  };
+
+  const fuelPricingRows = tryParseFuelPricingReport();
+  if (fuelPricingRows.length > 0) return fuelPricingRows;
+
   for (const line of lines) {
     if (/category\s*:/i.test(line) || /all\s+transactions/i.test(line) || /purchase\s+date/i.test(line)) {
       continue;
@@ -3140,6 +3283,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
 
     const values = [];
     const where = [];
+    const resolvedCustomerExpr = `COALESCE(t.customer_id, card_map.mapped_customer_id)`;
 
     if (date_from) {
       values.push(date_from);
@@ -3155,7 +3299,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
         return res.status(400).json({ message: "Invalid customer_id" });
       }
       values.push(customerIdNum);
-      where.push(`t.customer_id = $${values.length}`);
+      where.push(`${resolvedCustomerExpr} = $${values.length}`);
     }
     if (card_number) {
       values.push(String(card_number).trim());
@@ -3167,7 +3311,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
     const totalsResult = await pool.query(
       `WITH deduped AS (
          SELECT DISTINCT ON (
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3175,9 +3319,24 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
            COALESCE(t.total_amount, 0)
          ) t.id, t.volume_liters, t.total_amount
          FROM transactions t
+         LEFT JOIN LATERAL (
+           SELECT
+             cd.customer_id AS mapped_customer_id,
+             cd.customer_number,
+             cd.company_name
+           FROM cards cd
+           WHERE cd.card_number = t.card_number
+              OR regexp_replace(cd.card_number, '\\D', '', 'g') = regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+              OR (
+                right(regexp_replace(cd.card_number, '\\D', '', 'g'), 4) <> ''
+                AND right(regexp_replace(cd.card_number, '\\D', '', 'g'), 4) = right(regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g'), 4)
+              )
+           ORDER BY cd.id DESC
+           LIMIT 1
+         ) card_map ON TRUE
          ${whereSql}
          ORDER BY
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3197,7 +3356,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
     const dataResult = await pool.query(
       `WITH deduped AS (
          SELECT DISTINCT ON (
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3227,7 +3386,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
          LEFT JOIN customers c_map ON c_map.id = card_map.mapped_customer_id
          ${whereSql}
          ORDER BY
-           COALESCE(t.customer_id, -1),
+           COALESCE(${resolvedCustomerExpr}, -1),
            COALESCE(t.card_number, ''),
            COALESCE(t.document_number, ''),
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
@@ -3243,12 +3402,45 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
     );
 
     const rawColumns = new Set();
+    const normalizeRawKey = (key) =>
+      String(key || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+    const blockedRawColumns = new Set([
+      "amount",
+      "total",
+      "total_amount",
+      "card_number",
+      "driver_name",
+      "location",
+      "site_name",
+      "product",
+      "volume_liters",
+      "litres",
+      "liters",
+      "customer_number",
+      "company_name",
+      "document_number",
+      "purchase_datetime",
+      "transaction_date",
+      "raw_line",
+      "parser_mode",
+      "numeric_tokens",
+    ]);
     const rows = dataResult.rows.map((row) => {
       const raw = row?.source_raw_json && typeof row.source_raw_json === "object" ? row.source_raw_json : {};
-      Object.keys(raw).forEach((key) => {
-        if (key && key !== "raw_line") rawColumns.add(key);
+      const normalizedRaw = {};
+      Object.entries(raw).forEach(([key, value]) => {
+        const normalizedKey = normalizeRawKey(key);
+        if (!normalizedKey || blockedRawColumns.has(normalizedKey)) return;
+        if (!Object.prototype.hasOwnProperty.call(normalizedRaw, normalizedKey) || normalizedRaw[normalizedKey] == null || normalizedRaw[normalizedKey] === "") {
+          normalizedRaw[normalizedKey] = value;
+        }
       });
-      return row;
+      Object.keys(normalizedRaw).forEach((key) => rawColumns.add(key));
+      return { ...row, source_raw_json: normalizedRaw };
     });
 
     return res.json({
@@ -3294,7 +3486,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
     }
     if (date_to) {
       values.push(date_to);
-      where.push(`t.purchase_datetime <= $${values.length}`);
+      where.push(`t.purchase_datetime < ($${values.length}::date + INTERVAL '1 day')`);
     }
     if (customer_id) {
       const customerIdNum = parseInt(customer_id, 10);
@@ -3357,8 +3549,16 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            SELECT cd.customer_id
            FROM cards cd
            WHERE cd.customer_id IS NOT NULL
-             AND regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g') =
-                 regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+             AND (
+               regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g') =
+               regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+               OR (
+                 right(regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g'), 4) <>
+                 '' AND
+                 right(regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g'), 4) =
+                 right(regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g'), 4)
+               )
+             )
            ORDER BY cd.id DESC
            LIMIT 1
          ) cm ON TRUE
@@ -3412,8 +3612,16 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            SELECT cd.customer_id
            FROM cards cd
            WHERE cd.customer_id IS NOT NULL
-             AND regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g') =
-                 regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+             AND (
+               regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g') =
+               regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+               OR (
+                 right(regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g'), 4) <>
+                 '' AND
+                 right(regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g'), 4) =
+                 right(regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g'), 4)
+               )
+             )
            ORDER BY cd.id DESC
            LIMIT 1
          ) cm ON TRUE
@@ -3649,7 +3857,7 @@ router.get("/transactions/uninvoiced", authMiddleware, async (req, res) => {
     }
     if (date_to) {
       values.push(date_to);
-      where.push(`t.purchase_datetime <= $${values.length}`);
+      where.push(`t.purchase_datetime < ($${values.length}::date + INTERVAL '1 day')`);
     }
     if (customer_id) {
       const customerIdNum = parseInt(customer_id, 10);

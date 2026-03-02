@@ -586,6 +586,20 @@ router.get("/", authMiddleware, async (req, res) => {
     const rlCols = await getRatesLinesColumns();
     const pick = (col, alias = col) => (rlCols.has(col) ? `rl.${col} AS ${alias}` : `NULL::numeric AS ${alias}`);
     const pickText = (col, alias = col) => (rlCols.has(col) ? `rl.${col} AS ${alias}` : `NULL::text AS ${alias}`);
+    const siteNumberQualityExpr = rlCols.has("site_number")
+      ? `CASE
+           WHEN NULLIF(TRIM(COALESCE(rl.site_number, '')), '') IS NOT NULL
+                AND TRIM(COALESCE(rl.site_number, '')) <> '-'
+           THEN 1 ELSE 0
+         END`
+      : "0";
+    const detailQualityExpr = [
+      rlCols.has("pst_per_liter") ? "CASE WHEN COALESCE(rl.pst_per_liter, 0) <> 0 THEN 1 ELSE 0 END" : "0",
+      rlCols.has("fet_per_liter") ? "CASE WHEN COALESCE(rl.fet_per_liter, 0) <> 0 THEN 1 ELSE 0 END" : "0",
+      rlCols.has("pft_per_liter") ? "CASE WHEN COALESCE(rl.pft_per_liter, 0) <> 0 THEN 1 ELSE 0 END" : "0",
+      rlCols.has("price_excl_gst_hst") ? "CASE WHEN COALESCE(rl.price_excl_gst_hst, 0) <> 0 THEN 1 ELSE 0 END" : "0",
+      rlCols.has("base_tax_excl") ? "CASE WHEN COALESCE(rl.base_tax_excl, 0) <> 0 THEN 1 ELSE 0 END" : "0",
+    ].join(" + ");
     const basePriceExpr = rlCols.has("base_price")
       ? "rl.base_price"
       : (rlCols.has("price") ? "rl.price" : "NULL::numeric");
@@ -649,28 +663,52 @@ router.get("/", authMiddleware, async (req, res) => {
         : `LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id`;
 
       const result = await pool.query(
-        `SELECT
-           rl.id,
-           rl.rates_file_id,
-           rl.site_name,
-           rl.province,
-           ${pickText("site_number")},
-           ${basePriceExpr} AS base_price,
-           ${pick("base_tax_excl")},
-           ${pick("price_excl_gst_hst")},
-           ${pick("pst_per_liter")},
-           ${pick("fet_per_liter")},
-           ${pick("pft_per_liter")},
-           rg.name AS rate_group_name,
-           COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
-           ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
-           rf.effective_date
-         FROM rates_lines rl
-         JOIN rates_files rf ON rl.rates_file_id = rf.id
-         JOIN customers c ON c.id = $1
-         ${assignmentJoin}
-         WHERE ${where.join(" AND ")}
-         ORDER BY rl.site_name ASC, rl.id ASC`,
+        `WITH ranked AS (
+           SELECT
+             rl.id,
+             rl.rates_file_id,
+             rl.site_name,
+             rl.province,
+             ${pickText("site_number")},
+             ${basePriceExpr} AS base_price,
+             ${pick("base_tax_excl")},
+             ${pick("price_excl_gst_hst")},
+             ${pick("pst_per_liter")},
+             ${pick("fet_per_liter")},
+             ${pick("pft_per_liter")},
+             rg.name AS rate_group_name,
+             COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
+             ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
+             rf.effective_date,
+             ROW_NUMBER() OVER (
+               PARTITION BY lower(COALESCE(rl.site_name, '')), upper(COALESCE(rl.province, '')), rf.effective_date
+               ORDER BY ${siteNumberQualityExpr} DESC, (${detailQualityExpr}) DESC, rl.id DESC
+             ) AS rn
+           FROM rates_lines rl
+           JOIN rates_files rf ON rl.rates_file_id = rf.id
+           JOIN customers c ON c.id = $1
+           ${assignmentJoin}
+           WHERE ${where.join(" AND ")}
+         )
+         SELECT
+           id,
+           rates_file_id,
+           site_name,
+           province,
+           site_number,
+           base_price,
+           base_tax_excl,
+           price_excl_gst_hst,
+           pst_per_liter,
+           fet_per_liter,
+           pft_per_liter,
+           rate_group_name,
+           markup_per_liter,
+           price,
+           effective_date
+         FROM ranked
+         WHERE rn = 1
+         ORDER BY site_name ASC, id ASC`,
         values
       );
 
@@ -739,19 +777,31 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT rl.id, rl.rates_file_id, rl.customer_id, rl.site_name,
-              rl.province, ${pickText("site_number")}, ${basePriceExpr} AS base_price, ${pick("base_tax_excl")},
-              ${pick("price_excl_gst_hst")}, ${pick("pst_per_liter")}, ${pick("fet_per_liter")}, ${pick("pft_per_liter")},
-              rg.name AS rate_group_name,
-              COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
-              ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
-              rl.created_at, rf.effective_date
-       FROM rates_lines rl
-       JOIN rates_files rf ON rl.rates_file_id = rf.id
-       LEFT JOIN customers c ON c.id = rl.customer_id
-       LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
-       WHERE ${where.join(" AND ")}
-       ORDER BY rl.site_name ASC, rl.id ASC`,
+      `WITH ranked AS (
+         SELECT rl.id, rl.rates_file_id, rl.customer_id, rl.site_name,
+                rl.province, ${pickText("site_number")}, ${basePriceExpr} AS base_price, ${pick("base_tax_excl")},
+                ${pick("price_excl_gst_hst")}, ${pick("pst_per_liter")}, ${pick("fet_per_liter")}, ${pick("pft_per_liter")},
+                rg.name AS rate_group_name,
+                COALESCE(rg.markup_per_liter, 0) AS markup_per_liter,
+                ((${basePriceExpr}) + COALESCE(rg.markup_per_liter, 0))::numeric AS price,
+                rl.created_at, rf.effective_date,
+                ROW_NUMBER() OVER (
+                  PARTITION BY lower(COALESCE(rl.site_name, '')), upper(COALESCE(rl.province, '')), rf.effective_date
+                  ORDER BY ${siteNumberQualityExpr} DESC, (${detailQualityExpr}) DESC, rl.id DESC
+                ) AS rn
+         FROM rates_lines rl
+         JOIN rates_files rf ON rl.rates_file_id = rf.id
+         LEFT JOIN customers c ON c.id = rl.customer_id
+         LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
+         WHERE ${where.join(" AND ")}
+       )
+       SELECT
+         id, rates_file_id, customer_id, site_name, province, site_number, base_price,
+         base_tax_excl, price_excl_gst_hst, pst_per_liter, fet_per_liter, pft_per_liter,
+         rate_group_name, markup_per_liter, price, created_at, effective_date
+       FROM ranked
+       WHERE rn = 1
+       ORDER BY site_name ASC, id ASC`,
       values
     );
 

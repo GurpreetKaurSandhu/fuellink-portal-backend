@@ -115,12 +115,12 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
       location: "location",
     };
     const allowedSortCustomer = {
-      date: "t.purchase_datetime",
-      amount: "COALESCE(t.total, t.total_amount, 0)",
-      litres: "t.volume_liters",
-      card_number: "t.card_number",
-      driver_name: "t.driver_name",
-      location: "t.location",
+      date: "d.purchase_datetime",
+      amount: "COALESCE(d.total, d.total_amount, 0)",
+      litres: "d.volume_liters",
+      card_number: "d.card_number",
+      driver_name: "d.driver_name",
+      location: "d.location",
     };
 
     const where = [];
@@ -172,12 +172,34 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
       const sortColumn = allowedSortAdmin[sortBy] || allowedSortAdmin.date;
 
       const totalsSql = `
+        WITH deduped AS (
+          SELECT DISTINCT ON (
+            COALESCE(customer_id, -1),
+            COALESCE(card_number, ''),
+            COALESCE(document_number, ''),
+            COALESCE(purchase_datetime, 'epoch'::timestamp),
+            COALESCE(volume_liters, 0),
+            COALESCE(total_amount, 0)
+          )
+            id,
+            volume_liters,
+            total_amount
+          FROM transactions
+          ${whereSql}
+          ORDER BY
+            COALESCE(customer_id, -1),
+            COALESCE(card_number, ''),
+            COALESCE(document_number, ''),
+            COALESCE(purchase_datetime, 'epoch'::timestamp),
+            COALESCE(volume_liters, 0),
+            COALESCE(total_amount, 0),
+            id DESC
+        )
         SELECT
           COUNT(*)::int AS count,
           COALESCE(SUM(volume_liters), 0) AS total_litres,
           COALESCE(SUM(total_amount), 0) AS total_amount
-        FROM transactions
-        ${whereSql}
+        FROM deduped
       `;
 
       const totalsResult = await pool.query(totalsSql, values);
@@ -189,9 +211,47 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
 
       const offset = (pageNum - 1) * pageSizeNum;
       const dataSql = `
-        SELECT *
-        FROM transactions
-        ${whereSql}
+        WITH deduped AS (
+          SELECT DISTINCT ON (
+            COALESCE(t.customer_id, -1),
+            COALESCE(t.card_number, ''),
+            COALESCE(t.document_number, ''),
+            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+            COALESCE(t.volume_liters, 0),
+            COALESCE(t.total_amount, 0)
+          )
+            t.*,
+            COALESCE(c.company_name, c_card.company_name) AS customer_company_name
+          FROM transactions t
+          LEFT JOIN customers c ON c.id = t.customer_id
+          LEFT JOIN LATERAL (
+            SELECT c2.company_name
+            FROM cards cd
+            JOIN customers c2 ON c2.id = cd.customer_id
+            WHERE cd.customer_id IS NOT NULL
+              AND (
+                regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g') =
+                regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g')
+                OR (
+                  right(regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g'), 4) <> ''
+                  AND right(regexp_replace(COALESCE(cd.card_number, ''), '\\D', '', 'g'), 4) =
+                      right(regexp_replace(COALESCE(t.card_number, ''), '\\D', '', 'g'), 4)
+                )
+              )
+            ORDER BY cd.id DESC
+            LIMIT 1
+          ) c_card ON TRUE
+          ${whereSql.replace(/FROM transactions\b/, "FROM transactions t")}
+          ORDER BY
+            COALESCE(t.customer_id, -1),
+            COALESCE(t.card_number, ''),
+            COALESCE(t.document_number, ''),
+            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+            COALESCE(t.volume_liters, 0),
+            COALESCE(t.total_amount, 0),
+            t.id DESC
+        )
+        SELECT * FROM deduped
         ORDER BY ${sortColumn} ${sortOrder}
         LIMIT $${values.length + 1} OFFSET $${values.length + 2}
       `;
@@ -216,15 +276,52 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
 
     const sortColumnCustomer = allowedSortCustomer[sortBy] || allowedSortCustomer.date;
 
+    const assignmentsExistsResult = await pool.query(
+      `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
+    );
+    const hasAssignmentsTable = !!assignmentsExistsResult.rows[0]?.exists;
+    const customerRateJoinSql = hasAssignmentsTable
+      ? `LEFT JOIN LATERAL (
+           SELECT crga.rate_group_id
+           FROM customer_rate_group_assignments crga
+           WHERE crga.customer_id = t.customer_id
+             AND crga.start_date <= COALESCE(t.purchase_datetime::date, CURRENT_DATE)
+             AND (crga.end_date IS NULL OR crga.end_date >= COALESCE(t.purchase_datetime::date, CURRENT_DATE))
+           ORDER BY crga.start_date DESC, crga.id DESC
+           LIMIT 1
+         ) cra ON TRUE
+         LEFT JOIN rate_groups rg ON rg.id = COALESCE(cra.rate_group_id, c.rate_group_id)`
+      : `LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id`;
+
     const totalsResult = await pool.query(
-      `SELECT
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         )
+           t.*
+         FROM transactions t
+         LEFT JOIN customers c ON c.id = t.customer_id
+         ${customerRateJoinSql}
+         ${whereSqlCustomer}
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT
          COUNT(*)::int AS count,
-         COALESCE(SUM(t.volume_liters), 0) AS total_litres,
-         COALESCE(SUM(COALESCE(t.total, t.total_amount, 0)), 0) AS total_amount
-       FROM transactions t
-       LEFT JOIN customers c ON c.id = t.customer_id
-       LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
-       ${whereSqlCustomer}`,
+         COALESCE(SUM(d.volume_liters), 0) AS total_litres,
+         COALESCE(SUM(COALESCE(d.total, d.total_amount, 0)), 0) AS total_amount
+       FROM deduped d`,
       values
     );
     const totals = totalsResult.rows[0] || {
@@ -235,44 +332,67 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
 
     const offset = (pageNum - 1) * pageSizeNum;
     const dataResult = await pool.query(
-      `SELECT
-         t.purchase_datetime,
-         t.card_number,
-         t.driver_name,
-         t.location,
-         COALESCE(t.province, '') AS province,
-         t.product,
-         t.volume_liters,
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         )
+           t.*,
+           c.company_name AS customer_company_name,
+           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+         FROM transactions t
+         LEFT JOIN customers c ON c.id = t.customer_id
+         ${customerRateJoinSql}
+         ${whereSqlCustomer}
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT
+         d.purchase_datetime,
+         d.card_number,
+         d.driver_name,
+         d.customer_company_name AS company_name,
+         d.location,
+         COALESCE(d.province, '') AS province,
+         d.product,
+         d.volume_liters,
          COALESCE(
-           t.computed_rate_per_liter,
+           d.computed_rate_per_liter,
            CASE
-             WHEN COALESCE(t.volume_liters, 0) > 0 THEN ROUND(
-               (COALESCE(t.subtotal, t.total, t.total_amount, 0) / t.volume_liters) +
-               COALESCE(t.markup_per_liter, rg.markup_per_liter, 0),
+             WHEN COALESCE(d.volume_liters, 0) > 0 THEN ROUND(
+               (COALESCE(d.subtotal, d.total, d.total_amount, 0) / d.volume_liters) +
+               COALESCE(d.effective_markup_per_liter, d.markup_per_liter, 0),
                4
              )
              ELSE NULL
            END
          ) AS computed_rate_per_liter,
          COALESCE(
-           t.subtotal,
-           COALESCE(t.total, t.total_amount, 0) - COALESCE(t.gst, 0) - COALESCE(t.pst, 0) - COALESCE(t.qst, 0)
+           d.subtotal,
+           COALESCE(d.total, d.total_amount, 0) - COALESCE(d.gst, 0) - COALESCE(d.pst, 0) - COALESCE(d.qst, 0)
          ) AS subtotal,
-         COALESCE(t.gst, 0) AS gst,
-         COALESCE(t.pst, 0) AS pst,
-         COALESCE(t.qst, 0) AS qst,
+         COALESCE(d.gst, 0) AS gst,
+         COALESCE(d.pst, 0) AS pst,
+         COALESCE(d.qst, 0) AS qst,
          COALESCE(
-           t.total,
-           t.total_amount,
+           d.total,
+           d.total_amount,
            COALESCE(
-             t.subtotal,
-             COALESCE(t.total, t.total_amount, 0) - COALESCE(t.gst, 0) - COALESCE(t.pst, 0) - COALESCE(t.qst, 0)
-           ) + COALESCE(t.gst, 0) + COALESCE(t.pst, 0) + COALESCE(t.qst, 0)
+             d.subtotal,
+             COALESCE(d.total, d.total_amount, 0) - COALESCE(d.gst, 0) - COALESCE(d.pst, 0) - COALESCE(d.qst, 0)
+           ) + COALESCE(d.gst, 0) + COALESCE(d.pst, 0) + COALESCE(d.qst, 0)
          ) AS total
-       FROM transactions t
-       LEFT JOIN customers c ON c.id = t.customer_id
-       LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
-       ${whereSqlCustomer}
+       FROM deduped d
        ORDER BY ${sortColumnCustomer} ${sortOrder}
        LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
       values.concat([pageSizeNum, offset])
@@ -302,48 +422,86 @@ app.get("/api/transactions/export", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "date_from and date_to are required" });
     }
 
+    const assignmentsExistsResult = await pool.query(
+      `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
+    );
+    const hasAssignmentsTable = !!assignmentsExistsResult.rows[0]?.exists;
+    const customerRateJoinSql = hasAssignmentsTable
+      ? `LEFT JOIN LATERAL (
+           SELECT crga.rate_group_id
+           FROM customer_rate_group_assignments crga
+           WHERE crga.customer_id = t.customer_id
+             AND crga.start_date <= COALESCE(t.purchase_datetime::date, CURRENT_DATE)
+             AND (crga.end_date IS NULL OR crga.end_date >= COALESCE(t.purchase_datetime::date, CURRENT_DATE))
+           ORDER BY crga.start_date DESC, crga.id DESC
+           LIMIT 1
+         ) cra ON TRUE
+         LEFT JOIN rate_groups rg ON rg.id = COALESCE(cra.rate_group_id, c.rate_group_id)`
+      : `LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id`;
+
     const result = await pool.query(
-      `SELECT
-         t.purchase_datetime,
-         t.card_number,
-         t.driver_name,
-         t.location,
-         COALESCE(t.province, '') AS province,
-         t.product,
-         t.volume_liters,
+      `WITH deduped AS (
+         SELECT DISTINCT ON (
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0)
+         )
+           t.*,
+           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+         FROM transactions t
+         LEFT JOIN customers c ON c.id = t.customer_id
+         ${customerRateJoinSql}
+         WHERE t.customer_id = $1
+           AND t.purchase_datetime >= $2
+           AND t.purchase_datetime <= $3
+         ORDER BY
+           COALESCE(t.customer_id, -1),
+           COALESCE(t.card_number, ''),
+           COALESCE(t.document_number, ''),
+           COALESCE(t.purchase_datetime, 'epoch'::timestamp),
+           COALESCE(t.volume_liters, 0),
+           COALESCE(t.total_amount, 0),
+           t.id DESC
+       )
+       SELECT
+         d.purchase_datetime,
+         d.card_number,
+         d.driver_name,
+         d.location,
+         COALESCE(d.province, '') AS province,
+         d.product,
+         d.volume_liters,
          COALESCE(
-           t.computed_rate_per_liter,
+           d.computed_rate_per_liter,
            CASE
-             WHEN COALESCE(t.volume_liters, 0) > 0 THEN ROUND(
-               (COALESCE(t.subtotal, t.total, t.total_amount, 0) / t.volume_liters) +
-               COALESCE(t.markup_per_liter, rg.markup_per_liter, 0),
+             WHEN COALESCE(d.volume_liters, 0) > 0 THEN ROUND(
+               (COALESCE(d.subtotal, d.total, d.total_amount, 0) / d.volume_liters) +
+               COALESCE(d.effective_markup_per_liter, d.markup_per_liter, 0),
                4
              )
              ELSE NULL
            END
          ) AS computed_rate_per_liter,
-       COALESCE(
-           t.subtotal,
-           COALESCE(t.total, t.total_amount, 0) - COALESCE(t.gst, 0) - COALESCE(t.pst, 0) - COALESCE(t.qst, 0)
-         ) AS subtotal,
-         COALESCE(t.gst, 0) AS gst,
-         COALESCE(t.pst, 0) AS pst,
-         COALESCE(t.qst, 0) AS qst,
          COALESCE(
-           t.total,
-           t.total_amount,
+           d.subtotal,
+           COALESCE(d.total, d.total_amount, 0) - COALESCE(d.gst, 0) - COALESCE(d.pst, 0) - COALESCE(d.qst, 0)
+         ) AS subtotal,
+         COALESCE(d.gst, 0) AS gst,
+         COALESCE(d.pst, 0) AS pst,
+         COALESCE(d.qst, 0) AS qst,
+         COALESCE(
+           d.total,
+           d.total_amount,
            COALESCE(
-             t.subtotal,
-             COALESCE(t.total, t.total_amount, 0) - COALESCE(t.gst, 0) - COALESCE(t.pst, 0) - COALESCE(t.qst, 0)
-           ) + COALESCE(t.gst, 0) + COALESCE(t.pst, 0) + COALESCE(t.qst, 0)
+             d.subtotal,
+             COALESCE(d.total, d.total_amount, 0) - COALESCE(d.gst, 0) - COALESCE(d.pst, 0) - COALESCE(d.qst, 0)
+           ) + COALESCE(d.gst, 0) + COALESCE(d.pst, 0) + COALESCE(d.qst, 0)
          ) AS total
-       FROM transactions t
-       LEFT JOIN customers c ON c.id = t.customer_id
-       LEFT JOIN rate_groups rg ON rg.id = c.rate_group_id
-       WHERE t.customer_id = $1
-         AND t.purchase_datetime >= $2
-         AND t.purchase_datetime <= $3
-       ORDER BY t.purchase_datetime DESC, t.id DESC`,
+       FROM deduped d
+       ORDER BY d.purchase_datetime DESC, d.id DESC`,
       [req.user.customer_id, dateFrom, dateTo]
     );
 
