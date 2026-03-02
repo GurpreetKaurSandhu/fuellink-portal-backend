@@ -3317,7 +3317,15 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
            COALESCE(t.purchase_datetime, 'epoch'::timestamp),
            COALESCE(t.volume_liters, 0),
            COALESCE(t.total_amount, 0)
-         ) t.id, t.volume_liters, t.total_amount
+         ) t.id, t.volume_liters,
+           COALESCE(
+             NULLIF(t.total_amount, 0),
+             CASE
+               WHEN COALESCE(t.source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (t.source_raw_json->>'amount')::numeric
+               ELSE 0
+             END
+           ) AS amount_value
          FROM transactions t
          LEFT JOIN LATERAL (
            SELECT
@@ -3347,7 +3355,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
        SELECT
          COUNT(*)::int AS count,
          COALESCE(SUM(volume_liters), 0) AS total_litres,
-         COALESCE(SUM(total_amount), 0) AS total_amount
+         COALESCE(SUM(amount_value), 0) AS total_amount
        FROM deduped`,
       values
     );
