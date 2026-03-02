@@ -1494,6 +1494,49 @@ router.post(
   }
 );
 
+// Admin utility: reset all PDF-imported transaction data so files can be reloaded cleanly.
+router.post("/transactions/reset-pdf-imports", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const deleteTransactions = await client.query(
+        `DELETE FROM transactions
+         WHERE source_type = 'pdf'
+            OR source_upload_id IN (
+              SELECT id FROM transaction_uploads WHERE source_type = 'pdf'
+            )`
+      );
+
+      const deleteUploads = await client.query(
+        `DELETE FROM transaction_uploads
+         WHERE source_type = 'pdf'`
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        message: "PDF-imported transactions reset successfully",
+        deleted_transactions: deleteTransactions.rowCount || 0,
+        deleted_uploads: deleteUploads.rowCount || 0,
+      });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_rollbackErr) {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("Reset PDF imports error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
 router.post(
   "/upload-transactions-csv",
   authMiddleware,
