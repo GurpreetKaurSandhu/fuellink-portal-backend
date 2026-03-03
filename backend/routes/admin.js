@@ -402,6 +402,7 @@ const ensureInvoiceBatchPhase2Schema = async () => {
       ADD COLUMN IF NOT EXISTS pst NUMERIC(14,4),
       ADD COLUMN IF NOT EXISTS qst NUMERIC(14,4),
       ADD COLUMN IF NOT EXISTS amount_total NUMERIC(14,4),
+      ADD COLUMN IF NOT EXISTS markup_checked BOOLEAN NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS flags TEXT[] DEFAULT ARRAY[]::TEXT[]
   `);
 };
@@ -3899,9 +3900,17 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          card_number,
          document_number,
          location,
+         city,
          COALESCE(province, '') AS province,
          product,
          volume_liters,
+         COALESCE(
+           base_rate,
+           NULLIF(source_raw_json->>'base_rate', '')::numeric,
+           NULLIF(source_raw_json->>'ex_tax', '')::numeric
+         )::numeric AS base_rate,
+         COALESCE(fet, NULLIF(source_raw_json->>'fet', '')::numeric, NULLIF(source_raw_json->>'fet_per_liter', '')::numeric)::numeric AS fet,
+         COALESCE(pft, NULLIF(source_raw_json->>'pft', '')::numeric, NULLIF(source_raw_json->>'pft_per_liter', '')::numeric)::numeric AS pft,
          COALESCE(
            computed_rate_per_liter,
            CASE
@@ -3919,6 +3928,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          COALESCE(gst, 0) AS gst,
          COALESCE(pst, 0) AS pst,
          COALESCE(qst, 0) AS qst,
+         COALESCE(driver_name, source_raw_json->>'driver_name') AS driver_name,
          COALESCE(
            total,
            total_amount,
@@ -4355,6 +4365,7 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
          ibt.pst,
          ibt.qst,
          ibt.amount_total,
+         ibt.markup_checked,
          ibt.flags,
          t.id AS transaction_id,
          t.customer_id,
@@ -4363,9 +4374,13 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
          t.card_number,
          t.purchase_datetime,
          t.location,
+         t.city,
          t.province,
          t.product,
          t.volume_liters,
+         t.fet,
+         t.pft,
+         t.driver_name,
          COALESCE(t.total, t.total_amount, 0) AS total_amount,
          t.document_number,
          COALESCE(t.is_invoiced, false) AS is_invoiced
@@ -4550,7 +4565,8 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
            pst = $15,
            qst = $16,
            amount_total = $17,
-           flags = $18
+           flags = $18,
+           markup_checked = false
          WHERE id = $1`,
         [
           row.batch_line_id,
@@ -4628,6 +4644,20 @@ router.post("/invoice-batches/:id/mark-reviewed", authMiddleware, async (req, re
       });
     }
 
+    const uncheckedRows = await pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM invoice_batch_transactions
+       WHERE invoice_batch_id = $1
+         AND line_status = 'READY'
+         AND COALESCE(markup_checked, false) = false`,
+      [batchId]
+    );
+    if ((uncheckedRows.rows[0]?.count || 0) > 0) {
+      return res.status(409).json({
+        message: "Cannot mark reviewed until markup checkbox is verified for all READY rows.",
+      });
+    }
+
     const updateResult = await pool.query(
       `UPDATE invoice_batches
        SET status = 'REVIEWED',
@@ -4642,12 +4672,109 @@ router.post("/invoice-batches/:id/mark-reviewed", authMiddleware, async (req, re
       return res.status(404).json({ message: "Batch not found" });
     }
 
+    const summary = await pool.query(
+      `SELECT
+         COUNT(*)::int AS row_count,
+         COUNT(DISTINCT customer_id)::int AS customer_count
+       FROM invoice_batch_transactions
+       WHERE invoice_batch_id = $1`,
+      [batchId]
+    );
+
     return res.json({
       message: "Batch marked as reviewed",
       batch: updateResult.rows[0],
+      prompt: {
+        action: "generate_invoices",
+        message: "Batch reviewed. Generate invoices now?",
+      },
+      summary: summary.rows[0] || { row_count: 0, customer_count: 0 },
     });
   } catch (err) {
     console.error("Mark reviewed error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+router.patch("/invoice-batches/:batchId/rows/:batchLineId", authMiddleware, async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase2Schema();
+
+    const batchId = parseInt(req.params.batchId, 10);
+    const batchLineId = parseInt(req.params.batchLineId, 10);
+    if (!Number.isInteger(batchId) || batchId < 1 || !Number.isInteger(batchLineId) || batchLineId < 1) {
+      return res.status(400).json({ message: "Invalid batch id or row id" });
+    }
+
+    const batchResult = await pool.query(
+      `SELECT id, status FROM invoice_batches WHERE id = $1 LIMIT 1`,
+      [batchId]
+    );
+    if (batchResult.rows.length === 0) {
+      return res.status(404).json({ message: "Batch not found" });
+    }
+    if (String(batchResult.rows[0].status || "").toUpperCase() === "INVOICED") {
+      return res.status(409).json({ message: "Cannot edit rows after batch is invoiced" });
+    }
+
+    const getNumberOrNull = (value) => {
+      if (value === undefined || value === null || String(value).trim() === "") return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const ratePerLtr = getNumberOrNull(req.body?.rate_per_ltr);
+    const subtotal = getNumberOrNull(req.body?.subtotal);
+    const gst = getNumberOrNull(req.body?.gst);
+    const pst = getNumberOrNull(req.body?.pst);
+    const qst = getNumberOrNull(req.body?.qst);
+    const amountTotal = getNumberOrNull(req.body?.amount_total);
+    const markupChecked = req.body?.markup_checked === true;
+    const issueNote = req.body?.issue_note == null ? null : String(req.body.issue_note).trim();
+
+    const update = await pool.query(
+      `UPDATE invoice_batch_transactions
+       SET
+         rate_per_ltr = COALESCE($3, rate_per_ltr),
+         subtotal = COALESCE($4, subtotal),
+         gst = COALESCE($5, gst),
+         pst = COALESCE($6, pst),
+         qst = COALESCE($7, qst),
+         amount_total = COALESCE($8, amount_total),
+         markup_checked = $9,
+         issue_note = COALESCE($10, issue_note),
+         line_status = CASE
+           WHEN line_status IN ('RATE_MISSING', 'MARKUP_MISSING', 'ERROR') AND $9 = true THEN 'READY'
+           ELSE line_status
+         END
+       WHERE invoice_batch_id = $1
+         AND id = $2
+       RETURNING *`,
+      [
+        batchId,
+        batchLineId,
+        ratePerLtr,
+        subtotal,
+        gst,
+        pst,
+        qst,
+        amountTotal,
+        markupChecked,
+        issueNote,
+      ]
+    );
+
+    if (update.rows.length === 0) {
+      return res.status(404).json({ message: "Batch row not found" });
+    }
+
+    return res.json({
+      message: "Batch row updated",
+      row: update.rows[0],
+    });
+  } catch (err) {
+    console.error("Update batch row error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
