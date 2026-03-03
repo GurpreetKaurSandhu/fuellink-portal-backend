@@ -875,13 +875,17 @@ const parsePdfTransactionLines = (text) => {
   // Dedicated parser for invoice-style exports where each transaction is spread over multiple lines:
   // Card # + Company + Date + Location + City/Prov/Doc/Product/Numbers + Amount + Driver.
   const tryParseInvoiceStyleReport = () => {
-    if (!/Card #Company NameDateLocationCityProvDocument #ProductVolume \(L\)Base Rate/i.test(String(text || ""))) {
+    const textBlob = String(text || "");
+    if (
+      !/Card\s*#\s*Company\s*Name\s*Date\s*Location\s*City\s*Prov\s*Document\s*#/i.test(textBlob) ||
+      !/Product\s*Volume\s*\(L\)/i.test(textBlob)
+    ) {
       return [];
     }
 
-    const productRegex = /\b(DSL-LS|DEF BULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)\b/i;
+    const productRegex = /\b(DSL-LS|DEF BULK|DEFBULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)\b/i;
     const provinceDocProductRegex =
-      /^(.*?)(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)(\d{7,}[A-Z]?)(DSL-LS|DEF BULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)(.*)$/i;
+      /^(.*?)(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)\s*(\d{7,}[A-Z]?)(DSL-LS|DEF BULK|DEFBULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)(.*)$/i;
     const amountOnlyRegex = /^\d{1,3}(?:,\d{3})*(?:\.\d{2})$/;
     const rows = [];
 
@@ -985,16 +989,17 @@ const parsePdfTransactionLines = (text) => {
         continue;
       }
 
-      const city = String(core[1] || "").trim() || null;
+      const city = String(core[1] || "").replace(/^P\s+/i, "").trim() || null;
       const province = String(core[2] || "").toUpperCase();
       const document_number = String(core[3] || "").trim() || null;
-      const product = String(core[4] || "").toUpperCase();
+      let product = String(core[4] || "").toUpperCase();
+      if (product === "DEFBULK") product = "DEF BULK";
       const numericValues = (String(core[5] || "").match(/\d+\.\d{2}/g) || [])
         .map((v) => parseNumber(v))
         .filter((v) => Number.isFinite(v));
 
       const volume_liters = numericValues[0];
-      if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 5000) {
+      if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 10000) {
         i = Math.max(i + 1, dataIndex + 1);
         continue;
       }
