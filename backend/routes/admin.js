@@ -1271,6 +1271,171 @@ const parsePdfTransactionLines = (text) => {
   const invoiceFallbackRows = tryParseInvoiceBlockFallback();
   if (invoiceFallbackRows.length > 0) return invoiceFallbackRows;
 
+  // Final fallback: date-anchored invoice parser for heavily wrapped exports.
+  const tryParseDateAnchoredInvoiceBlocks = () => {
+    const rows = [];
+    const dateRegex = /20\d{2}\/\d{2}\/\d{2}/;
+    const provinceDocProductRegex =
+      /^(.*?)(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)\s*([0-9]{6,}[A-Z]?)(DSL-LS|DEF BULK|DEFBULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)(.*)$/i;
+    const amountOnlyRegex = /^\d{1,3}(?:,\d{3})*(?:\.\d{2})$/;
+
+    const isNoise = (line) =>
+      !line ||
+      /Card\s*#.*Company\s*Name.*Date.*Location.*Prov.*Document\s*#.*Product/i.test(line) ||
+      /^Fuel Pricing Report by Card$/i.test(line) ||
+      /^Purchase Details by Card$/i.test(line) ||
+      /^Selection:/i.test(line) ||
+      /^Account:/i.test(line) ||
+      /^Page:/i.test(line) ||
+      /^\(Memo\)$/i.test(line);
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const dateLineRaw = String(lines[i] || "").trim();
+      if (!dateRegex.test(dateLineRaw)) continue;
+
+      const dateMatch = dateLineRaw.match(dateRegex);
+      const purchase_datetime = parseDateTime(dateMatch ? dateMatch[0] : null);
+      if (!purchase_datetime) continue;
+
+      let cardLineIdx = -1;
+      for (let b = i - 1; b >= Math.max(0, i - 6); b -= 1) {
+        const prev = String(lines[b] || "").trim();
+        if (/^\d{4}/.test(prev)) {
+          cardLineIdx = b;
+          break;
+        }
+      }
+      if (cardLineIdx < 0) continue;
+
+      const cardLine = String(lines[cardLineIdx] || "").trim();
+      const cardMatch = cardLine.match(/^(\d{4})/);
+      if (!cardMatch) continue;
+      const card_number = cardMatch[1];
+
+      const companyParts = [];
+      const firstCompany = cardLine.slice(cardMatch[0].length).trim();
+      if (firstCompany) companyParts.push(firstCompany);
+      for (let c = cardLineIdx + 1; c < i; c += 1) {
+        const part = String(lines[c] || "").trim();
+        if (!part || isNoise(part)) continue;
+        if (dateRegex.test(part)) continue;
+        if (/^\d{4}/.test(part)) break;
+        companyParts.push(part);
+      }
+
+      const afterDate = dateLineRaw
+        .slice((dateMatch.index || 0) + dateMatch[0].length)
+        .trim();
+      const locationParts = [];
+      if (afterDate) locationParts.push(afterDate);
+
+      let dataLine = "";
+      let dataIndex = -1;
+      for (let d = i + 1; d <= Math.min(lines.length - 1, i + 6); d += 1) {
+        const part = String(lines[d] || "").trim();
+        if (!part || isNoise(part)) continue;
+        if (dateRegex.test(part) || /^\d{4}/.test(part)) break;
+        if (provinceDocProductRegex.test(part)) {
+          dataLine = part;
+          dataIndex = d;
+          break;
+        }
+        locationParts.push(part);
+      }
+      if (!dataLine) continue;
+
+      const core = dataLine.match(provinceDocProductRegex);
+      if (!core) continue;
+
+      const city = String(core[1] || "").replace(/^P\s+/i, "").trim() || null;
+      const province = String(core[2] || "").toUpperCase();
+      const document_number = String(core[3] || "").trim() || null;
+      let product = String(core[4] || "").toUpperCase();
+      if (product === "DEFBULK") product = "DEF BULK";
+
+      const numericValues = (String(core[5] || "").match(/\d+\.\d{2,4}/g) || [])
+        .map((v) => parseNumber(v))
+        .filter((v) => Number.isFinite(v));
+
+      const volume_liters = numericValues[0];
+      if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 20000) continue;
+
+      const base_rate = numericValues[1] ?? null;
+      const fet = numericValues[2] ?? null;
+      const pft = numericValues[3] ?? null;
+      const rate_per_ltr = numericValues[4] ?? null;
+      const subtotal = numericValues[5] ?? null;
+      const gst_hst = numericValues[6] ?? null;
+      const pst = numericValues[7] ?? null;
+      const qst = numericValues[8] ?? null;
+
+      let amount = Number.isFinite(numericValues[numericValues.length - 1])
+        ? numericValues[numericValues.length - 1]
+        : null;
+      let nextIndex = dataIndex + 1;
+      if (nextIndex >= 0) {
+        const maybeAmount = String(lines[nextIndex] || "").trim();
+        if (amountOnlyRegex.test(maybeAmount)) {
+          amount = parseNumber(maybeAmount);
+          nextIndex += 1;
+        }
+      }
+
+      const driverParts = [];
+      while (nextIndex >= 0 && nextIndex < lines.length && driverParts.length < 3) {
+        const part = String(lines[nextIndex] || "").trim();
+        if (!part || isNoise(part)) {
+          nextIndex += 1;
+          continue;
+        }
+        if (dateRegex.test(part) || /^\d{4}/.test(part)) break;
+        if (amountOnlyRegex.test(part)) {
+          nextIndex += 1;
+          continue;
+        }
+        driverParts.push(part);
+        nextIndex += 1;
+      }
+
+      const location = normalizeLocationForMatch(locationParts.join(" ").trim()) || null;
+      const company_name = companyParts.join(" ").replace(/\s+/g, " ").trim() || null;
+      const driver_name = cleanDriver(driverParts.join(" ")) || null;
+
+      rows.push({
+        card_number,
+        driver_name,
+        purchase_datetime,
+        location,
+        city,
+        province,
+        document_number,
+        product,
+        volume_liters,
+        amount: Number.isFinite(amount) ? amount : null,
+        source_raw_json: {
+          parser_mode: "invoice-date-anchored-fallback",
+          company_name,
+          city,
+          base_rate,
+          fet,
+          pft,
+          rate_per_ltr,
+          subtotal,
+          gst_hst,
+          pst,
+          qst,
+          amount: Number.isFinite(amount) ? amount : null,
+          raw_line: [cardLine, ...companyParts, dateLineRaw, ...locationParts, dataLine, ...driverParts].join(" | "),
+        },
+      });
+    }
+
+    return rows;
+  };
+
+  const invoiceDateFallbackRows = tryParseDateAnchoredInvoiceBlocks();
+  if (invoiceDateFallbackRows.length > 0) return invoiceDateFallbackRows;
+
   for (const line of lines) {
     if (/category\s*:/i.test(line) || /all\s+transactions/i.test(line) || /purchase\s+date/i.test(line)) {
       continue;
