@@ -1079,6 +1079,198 @@ const parsePdfTransactionLines = (text) => {
   const invoiceStyleRows = tryParseInvoiceStyleReport();
   if (invoiceStyleRows.length > 0) return invoiceStyleRows;
 
+  // Fallback parser for tightly wrapped invoice PDFs where rows are split across
+  // many lines and company/location tokens are broken aggressively.
+  const tryParseInvoiceBlockFallback = () => {
+    const rows = [];
+    const productRegex = /\b(DSL-LS|DEF BULK|DEFBULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)\b/i;
+    const provinceDocProductRegex =
+      /^(.*?)(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)\s*([0-9]{6,}[A-Z]?)(DSL-LS|DEF BULK|DEFBULK|DEF|DSL|ULS|GAS|REG|PREM|OCT)(.*)$/i;
+    const amountOnlyRegex = /^\d{1,3}(?:,\d{3})*(?:\.\d{2})$/;
+    const isHeaderLine = (line) =>
+      /Card\s*#.*Company\s*Name.*Date.*Location.*Prov.*Document\s*#.*Product/i.test(line) ||
+      /^Fuel Pricing Report by Card$/i.test(line) ||
+      /^Purchase Details by Card$/i.test(line) ||
+      /^Selection:/i.test(line) ||
+      /^Account:/i.test(line) ||
+      /^Page:/i.test(line);
+
+    let i = 0;
+    while (i < lines.length) {
+      const start = String(lines[i] || "").trim();
+      if (!start || isHeaderLine(start) || !/^\d{4}/.test(start)) {
+        i += 1;
+        continue;
+      }
+
+      const cardMatch = start.match(/^(\d{4})/);
+      if (!cardMatch) {
+        i += 1;
+        continue;
+      }
+      const card_number = cardMatch[1];
+      const companyParts = [];
+      const startRemainder = start.slice(cardMatch[0].length).trim();
+      if (startRemainder) companyParts.push(startRemainder);
+
+      let cursor = i + 1;
+      let dateLine = "";
+      while (cursor < lines.length) {
+        const part = String(lines[cursor] || "").trim();
+        if (!part) {
+          cursor += 1;
+          continue;
+        }
+        if (isHeaderLine(part)) {
+          cursor += 1;
+          continue;
+        }
+        if (/^\d{4}/.test(part) && !/20\d{2}\/\d{2}\/\d{2}/.test(part)) break;
+        if (/20\d{2}\/\d{2}\/\d{2}/.test(part)) {
+          dateLine = part;
+          break;
+        }
+        companyParts.push(part);
+        cursor += 1;
+      }
+      if (!dateLine) {
+        i += 1;
+        continue;
+      }
+
+      const dateMatch = dateLine.match(/20\d{2}\/\d{2}\/\d{2}/);
+      const purchase_datetime = parseDateTime(dateMatch ? dateMatch[0] : null);
+      if (!dateMatch || !purchase_datetime) {
+        i = Math.max(i + 1, cursor + 1);
+        continue;
+      }
+
+      const locationParts = [];
+      const afterDate = dateLine.slice((dateMatch.index || 0) + dateMatch[0].length).trim();
+      if (afterDate) locationParts.push(afterDate);
+
+      let dataLine = "";
+      let dataIndex = cursor + 1;
+      while (dataIndex < lines.length) {
+        const part = String(lines[dataIndex] || "").trim();
+        if (!part) {
+          dataIndex += 1;
+          continue;
+        }
+        if (isHeaderLine(part)) {
+          dataIndex += 1;
+          continue;
+        }
+        if (/^\d{4}/.test(part) && !/20\d{2}\/\d{2}\/\d{2}/.test(part)) break;
+        if (provinceDocProductRegex.test(part) && productRegex.test(part)) {
+          dataLine = part;
+          break;
+        }
+        locationParts.push(part);
+        dataIndex += 1;
+      }
+      if (!dataLine) {
+        i = Math.max(i + 1, dataIndex);
+        continue;
+      }
+
+      const core = dataLine.match(provinceDocProductRegex);
+      if (!core) {
+        i = Math.max(i + 1, dataIndex + 1);
+        continue;
+      }
+
+      const city = String(core[1] || "").replace(/^P\s+/i, "").trim() || null;
+      const province = String(core[2] || "").toUpperCase();
+      const document_number = String(core[3] || "").trim() || null;
+      let product = String(core[4] || "").toUpperCase();
+      if (product === "DEFBULK") product = "DEF BULK";
+
+      const numericValues = (String(core[5] || "").match(/\d+\.\d{2,4}/g) || [])
+        .map((v) => parseNumber(v))
+        .filter((v) => Number.isFinite(v));
+
+      const volume_liters = numericValues[0];
+      if (!Number.isFinite(volume_liters) || volume_liters <= 0 || volume_liters > 20000) {
+        i = Math.max(i + 1, dataIndex + 1);
+        continue;
+      }
+
+      const base_rate = numericValues[1] ?? null;
+      const fet = numericValues[2] ?? null;
+      const pft = numericValues[3] ?? null;
+      const rate_per_ltr = numericValues[4] ?? null;
+      const subtotal = numericValues[5] ?? null;
+      const gst_hst = numericValues[6] ?? null;
+      const pst = numericValues[7] ?? null;
+      const qst = numericValues[8] ?? null;
+
+      let amount = Number.isFinite(numericValues[numericValues.length - 1]) ? numericValues[numericValues.length - 1] : null;
+      let nextIndex = dataIndex + 1;
+      const nextLine = String(lines[nextIndex] || "").trim();
+      if (amountOnlyRegex.test(nextLine)) {
+        amount = parseNumber(nextLine);
+        nextIndex += 1;
+      }
+
+      const driverParts = [];
+      while (nextIndex < lines.length && driverParts.length < 3) {
+        const part = String(lines[nextIndex] || "").trim();
+        if (!part) {
+          nextIndex += 1;
+          continue;
+        }
+        if (isHeaderLine(part)) break;
+        if (/^\d{4}/.test(part) || /20\d{2}\/\d{2}\/\d{2}/.test(part)) break;
+        if (amountOnlyRegex.test(part)) {
+          nextIndex += 1;
+          continue;
+        }
+        driverParts.push(part);
+        nextIndex += 1;
+      }
+
+      const location = normalizeLocationForMatch(locationParts.join(" ").trim()) || null;
+      const company_name = companyParts.join(" ").replace(/\s+/g, " ").trim() || null;
+      const driver_name = cleanDriver(driverParts.join(" ")) || null;
+
+      rows.push({
+        card_number,
+        driver_name,
+        purchase_datetime,
+        location,
+        city,
+        province,
+        document_number,
+        product,
+        volume_liters,
+        amount: Number.isFinite(amount) ? amount : null,
+        source_raw_json: {
+          parser_mode: "invoice-style-fallback",
+          company_name,
+          city,
+          base_rate,
+          fet,
+          pft,
+          rate_per_ltr,
+          subtotal,
+          gst_hst,
+          pst,
+          qst,
+          amount: Number.isFinite(amount) ? amount : null,
+          raw_line: [start, ...companyParts, dateLine, ...locationParts, dataLine, ...driverParts].join(" | "),
+        },
+      });
+
+      i = Math.max(nextIndex, i + 1);
+    }
+
+    return rows;
+  };
+
+  const invoiceFallbackRows = tryParseInvoiceBlockFallback();
+  if (invoiceFallbackRows.length > 0) return invoiceFallbackRows;
+
   for (const line of lines) {
     if (/category\s*:/i.test(line) || /all\s+transactions/i.test(line) || /purchase\s+date/i.test(line)) {
       continue;
