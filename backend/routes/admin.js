@@ -1685,32 +1685,44 @@ const resolveCustomerIdByCard = async (client, rawCardNumber) => {
   const last4 = digits.length >= 4 ? digits.slice(-4) : "";
 
   const result = await client.query(
-    `SELECT DISTINCT COALESCE(cd.customer_id, cnum.id, cname.id) AS customer_id
-     FROM cards cd
-     LEFT JOIN customers cnum
-       ON cnum.customer_number IS NOT NULL
-      AND cd.customer_number IS NOT NULL
-      AND lower(trim(cnum.customer_number)) = lower(trim(cd.customer_number))
-     LEFT JOIN customers cname
-       ON cname.company_name IS NOT NULL
-      AND cd.company_name IS NOT NULL
-      AND lower(trim(cname.company_name)) = lower(trim(cd.company_name))
-     WHERE COALESCE(cd.customer_id, cnum.id, cname.id) IS NOT NULL
-       AND (
-         cd.card_number = $1
-         OR regexp_replace(cd.card_number, '\\D', '', 'g') = $2
-         OR (
-           $3 <> ''
-           AND lpad(right(regexp_replace(cd.card_number, '\\D', '', 'g'), 4), 4, '0') = lpad($3, 4, '0')
+    `WITH matches AS (
+       SELECT
+         COALESCE(cd.customer_id, cnum.id, cname.id) AS customer_id,
+         CASE
+           WHEN cd.card_number = $1 THEN 0
+           WHEN regexp_replace(cd.card_number, '\\D', '', 'g') = $2 THEN 1
+           ELSE 2
+         END AS match_rank,
+         cd.id
+       FROM cards cd
+       LEFT JOIN customers cnum
+         ON cnum.customer_number IS NOT NULL
+        AND cd.customer_number IS NOT NULL
+        AND lower(trim(cnum.customer_number)) = lower(trim(cd.customer_number))
+       LEFT JOIN customers cname
+         ON cname.company_name IS NOT NULL
+        AND cd.company_name IS NOT NULL
+        AND lower(trim(cname.company_name)) = lower(trim(cd.company_name))
+       WHERE COALESCE(cd.customer_id, cnum.id, cname.id) IS NOT NULL
+         AND (
+           cd.card_number = $1
+           OR regexp_replace(cd.card_number, '\\D', '', 'g') = $2
+           OR (
+             $3 <> ''
+             AND lpad(right(regexp_replace(cd.card_number, '\\D', '', 'g'), 4), 4, '0') = lpad($3, 4, '0')
+           )
          )
-       )
-     ORDER BY
-       CASE
-         WHEN cd.card_number = $1 THEN 0
-         WHEN regexp_replace(cd.card_number, '\\D', '', 'g') = $2 THEN 1
-         ELSE 2
-       END,
-       cd.id DESC
+     )
+     SELECT customer_id
+     FROM (
+       SELECT
+         customer_id,
+         MIN(match_rank) AS best_rank,
+         MAX(id) AS latest_card_id
+       FROM matches
+       GROUP BY customer_id
+     ) ranked
+     ORDER BY best_rank ASC, latest_card_id DESC
      LIMIT 10`,
     [raw, digits, last4]
   );
