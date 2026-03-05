@@ -135,6 +135,7 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
       const d = new Date(value);
       return !Number.isNaN(d.getTime());
     };
+    const isDateOnly = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
 
     if (isValidDate(date_from)) {
       addClause("purchase_datetime >= ?", date_from);
@@ -143,7 +144,11 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
     }
 
     if (isValidDate(date_to)) {
-      addClause("purchase_datetime <= ?", date_to);
+      if (isDateOnly(date_to)) {
+        addClause("purchase_datetime < (?::date + INTERVAL '1 day')", date_to);
+      } else {
+        addClause("purchase_datetime <= ?", date_to);
+      }
     } else if (date_to) {
       return res.status(400).json({ message: "Invalid date_to" });
     }
@@ -343,7 +348,7 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
          )
            t.*,
            c.company_name AS customer_company_name,
-           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+           COALESCE(rg.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
          LEFT JOIN customers c ON c.id = t.customer_id
          ${customerRateJoinSql}
@@ -369,9 +374,16 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
          COALESCE(
            d.computed_rate_per_liter,
            CASE
+             WHEN COALESCE(d.source_raw_json->>'rate_per_ltr', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'rate_per_ltr')::numeric
+             WHEN COALESCE(d.source_raw_json->>'rate_per_liter', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'rate_per_liter')::numeric
+             ELSE NULL
+           END,
+           CASE
              WHEN COALESCE(d.volume_liters, 0) > 0 THEN ROUND(
                (COALESCE(d.subtotal, d.total, d.total_amount, 0) / d.volume_liters) +
-               COALESCE(d.effective_markup_per_liter, d.markup_per_liter, 0),
+               COALESCE(d.effective_markup_per_liter, 0),
                4
              )
              ELSE NULL
@@ -450,7 +462,7 @@ app.get("/api/transactions/export", authMiddleware, async (req, res) => {
            COALESCE(t.total_amount, 0)
          )
            t.*,
-           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+           COALESCE(rg.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
          LEFT JOIN customers c ON c.id = t.customer_id
          ${customerRateJoinSql}
@@ -477,9 +489,16 @@ app.get("/api/transactions/export", authMiddleware, async (req, res) => {
          COALESCE(
            d.computed_rate_per_liter,
            CASE
+             WHEN COALESCE(d.source_raw_json->>'rate_per_ltr', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'rate_per_ltr')::numeric
+             WHEN COALESCE(d.source_raw_json->>'rate_per_liter', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'rate_per_liter')::numeric
+             ELSE NULL
+           END,
+           CASE
              WHEN COALESCE(d.volume_liters, 0) > 0 THEN ROUND(
                (COALESCE(d.subtotal, d.total, d.total_amount, 0) / d.volume_liters) +
-               COALESCE(d.effective_markup_per_liter, d.markup_per_liter, 0),
+               COALESCE(d.effective_markup_per_liter, 0),
                4
              )
              ELSE NULL

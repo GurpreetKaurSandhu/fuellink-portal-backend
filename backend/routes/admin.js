@@ -994,7 +994,9 @@ const parsePdfTransactionLines = (text) => {
       const document_number = String(core[3] || "").trim() || null;
       let product = String(core[4] || "").toUpperCase();
       if (product === "DEFBULK") product = "DEF BULK";
-      const numericValues = (String(core[5] || "").match(/\d+\.\d{2}/g) || [])
+      const numericValues = (
+        String(core[5] || "").match(/-?\$?\d+(?:,\d{3})*(?:\.\d{1,4})?/g) || []
+      )
         .map((v) => parseNumber(v))
         .filter((v) => Number.isFinite(v));
 
@@ -4378,11 +4380,18 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          )::numeric AS base_rate,
          COALESCE(fet, NULLIF(source_raw_json->>'fet', '')::numeric, NULLIF(source_raw_json->>'fet_per_liter', '')::numeric)::numeric AS fet,
          COALESCE(pft, NULLIF(source_raw_json->>'pft', '')::numeric, NULLIF(source_raw_json->>'pft_per_liter', '')::numeric)::numeric AS pft,
-         COALESCE(
-           computed_rate_per_liter,
-           CASE
-             WHEN COALESCE(volume_liters, 0) > 0 THEN ROUND(
-               (COALESCE(subtotal, total, total_amount, 0) / volume_liters) + COALESCE(effective_markup_per_liter, 0),
+        COALESCE(
+          computed_rate_per_liter,
+          CASE
+            WHEN COALESCE(source_raw_json->>'rate_per_ltr', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (source_raw_json->>'rate_per_ltr')::numeric
+            WHEN COALESCE(source_raw_json->>'rate_per_liter', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (source_raw_json->>'rate_per_liter')::numeric
+            ELSE NULL
+          END,
+          CASE
+            WHEN COALESCE(volume_liters, 0) > 0 THEN ROUND(
+              (COALESCE(subtotal, total, total_amount, 0) / volume_liters) + COALESCE(effective_markup_per_liter, 0),
                4
              )
              ELSE NULL
