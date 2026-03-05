@@ -2177,6 +2177,7 @@ router.post(
       for (const key of Object.keys(rows[0] || {})) {
         const normalized = normalizeHeader(key);
         if (normalized === "cardnumber" || normalized === "card") headerMap.card_number = key;
+        if (normalized === "companyname") headerMap.company_name = key;
         if (normalized === "purchasedatetime") headerMap.purchase_datetime = key;
         if (normalized === "purchasedate") headerMap.purchase_date = key;
         if (normalized === "purchasetime") headerMap.purchase_time = key;
@@ -2200,11 +2201,21 @@ router.post(
         if (normalized === "gsthst") headerMap.gst = key;
         if (normalized === "pst") headerMap.pst = key;
         if (normalized === "qst") headerMap.qst = key;
+        if (normalized === "baserate") headerMap.base_rate = key;
+        if (normalized === "rateperltr" || normalized === "rateperlitr" || normalized === "rateperliter") headerMap.rate_per_ltr = key;
+        if (normalized === "subtotal" || normalized === "subtoatl") headerMap.subtotal = key;
       }
 
       const hasDateTime = !!headerMap.purchase_datetime;
       const hasDateAndTime = !!headerMap.purchase_date && !!headerMap.purchase_time;
       const isSuperPass = !!headerMap.ex_tax;
+      const isInvoiceStyle = !!(
+        headerMap.base_rate &&
+        headerMap.rate_per_ltr &&
+        headerMap.subtotal &&
+        headerMap.gst &&
+        headerMap.total_amount
+      );
 
       if (!headerMap.card_number ||
           (!hasDateTime && !hasDateAndTime) ||
@@ -2315,16 +2326,14 @@ router.post(
             if (!Number.isFinite(total_amount)) throw new Error("Invalid total_amount");
 
             const customerData = await getCardCustomer(card_number);
-            if (!customerData?.customer_id) {
+            const customerIdNum = customerData?.customer_id || null;
+            if (!customerIdNum) {
               unmatchedCount += 1;
               unmatchedCards.add(card_number);
               if (unmatchedRows.length < 50) {
                 unmatchedRows.push({ row: idx + 2, card_number, reason: "card not mapped to customer" });
               }
-              continue;
             }
-
-            const customerIdNum = customerData.customer_id;
             const markupPerLiter = parseNumber(customerData.markup_per_liter) || 0;
 
             const driver_name = headerMap.driver_name
@@ -2359,6 +2368,10 @@ router.post(
             let source_pst = null;
             let source_qst = null;
             let source_ex_tax = null;
+            const sourceRawJson = {};
+            for (const [rawKey, rawValue] of Object.entries(row || {})) {
+              sourceRawJson[String(rawKey || "").trim()] = rawValue;
+            }
 
             if (isSuperPass) {
               const ex_tax = parseNumber(row[headerMap.ex_tax]);
@@ -2384,14 +2397,95 @@ router.post(
               computed_rate_per_liter = computed_in_tax;
             }
 
-            const rateResult = await client.query(
-              "SELECT price FROM rate_match($1,$2,$3,$4)",
-              [customerIdNum, province, location, purchaseDateTime]
-            );
-            if (rateResult.rows.length > 0 && rateResult.rows[0].price != null) {
-              computed_rate_per_liter = round4(parseFloat(rateResult.rows[0].price) + markupPerLiter);
+            if (isInvoiceStyle) {
+              const sheetBaseRate = parseNumber(row[headerMap.base_rate]);
+              const sheetRatePerLtr = parseNumber(row[headerMap.rate_per_ltr]);
+              const sheetSubtotal = parseNumber(row[headerMap.subtotal]);
+              const sheetGst = parseNumber(row[headerMap.gst]);
+              const sheetPst = parseNumber(row[headerMap.pst]);
+              const sheetQst = parseNumber(row[headerMap.qst]);
+              source_ex_tax = Number.isFinite(sheetBaseRate) ? sheetBaseRate : source_ex_tax;
+              source_fet = headerMap.fet ? parseNumber(row[headerMap.fet]) : source_fet;
+              source_pft = headerMap.pft ? parseNumber(row[headerMap.pft]) : source_pft;
+              computed_ex_tax = Number.isFinite(sheetBaseRate) ? round4(sheetBaseRate + markupPerLiter) : computed_ex_tax;
+              computed_rate_per_liter = Number.isFinite(sheetRatePerLtr) ? round4(sheetRatePerLtr) : computed_rate_per_liter;
               computed_in_tax = computed_rate_per_liter;
-              updatedCount += 1;
+
+              const subtotalFromSheet = Number.isFinite(sheetSubtotal)
+                ? round4(sheetSubtotal)
+                : round4((computed_in_tax || 0) * volume);
+              const gstFromSheet = Number.isFinite(sheetGst) ? round4(sheetGst) : 0;
+              const pstFromSheet = Number.isFinite(sheetPst) ? round4(sheetPst) : 0;
+              const qstFromSheet = Number.isFinite(sheetQst) ? round4(sheetQst) : 0;
+
+              const subtotal = subtotalFromSheet;
+              const gst = gstFromSheet;
+              const pst = pstFromSheet;
+              const qst = qstFromSheet;
+              const total = Number.isFinite(total_amount)
+                ? round4(total_amount)
+                : round4(subtotal + gst + pst + qst);
+
+              await client.query(
+                `INSERT INTO transactions
+                (customer_id, card_number, driver_name, purchase_datetime, product, volume_liters, total_amount, document_number, location, province,
+                 computed_rate_per_liter, subtotal, gst, pst, qst, total, computed_ex_tax, computed_in_tax,
+                 source_ex_tax, source_in_tax, source_fet, source_pft, source_fct_pct, source_urban, source_gst, source_pst, source_qst, source_amount,
+                 source_type, source_raw_json)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                        $11,$12,$13,$14,$15,$16,$17,$18,
+                        $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`,
+                [
+                  customerIdNum,
+                  card_number,
+                  combined_driver_name,
+                  purchaseDateTime,
+                  product,
+                  volume,
+                  total_amount,
+                  document_number,
+                  locationWithCity,
+                  province,
+                  computed_rate_per_liter,
+                  subtotal,
+                  gst,
+                  pst,
+                  qst,
+                  total,
+                  computed_ex_tax,
+                  computed_in_tax,
+                  source_ex_tax,
+                  source_in_tax,
+                  source_fet,
+                  source_pft,
+                  source_fct_pct,
+                  source_urban,
+                  source_gst,
+                  source_pst,
+                  source_qst,
+                  total_amount,
+                  "sheet",
+                  sourceRawJson,
+                ]
+              );
+              insertedCount += 1;
+              if (!minDate || purchaseDateTime < minDate) minDate = purchaseDateTime;
+              if (!maxDate || purchaseDateTime > maxDate) maxDate = purchaseDateTime;
+              continue;
+            }
+
+            if (customerIdNum) {
+              const rateResult = await client.query(
+                "SELECT price FROM rate_match($1,$2,$3,$4)",
+                [customerIdNum, province, location, purchaseDateTime]
+              );
+              if (rateResult.rows.length > 0 && rateResult.rows[0].price != null) {
+                computed_rate_per_liter = round4(parseFloat(rateResult.rows[0].price) + markupPerLiter);
+                computed_in_tax = computed_rate_per_liter;
+                updatedCount += 1;
+              } else {
+                missingRateCount += 1;
+              }
             } else {
               missingRateCount += 1;
             }
@@ -2416,10 +2510,11 @@ router.post(
               `INSERT INTO transactions
               (customer_id, card_number, driver_name, purchase_datetime, product, volume_liters, total_amount, document_number, location, province,
                computed_rate_per_liter, subtotal, gst, pst, qst, total, computed_ex_tax, computed_in_tax,
-               source_ex_tax, source_in_tax, source_fet, source_pft, source_fct_pct, source_urban, source_gst, source_pst, source_qst, source_amount)
+               source_ex_tax, source_in_tax, source_fet, source_pft, source_fct_pct, source_urban, source_gst, source_pst, source_qst, source_amount,
+               source_type, source_raw_json)
               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
                       $11,$12,$13,$14,$15,$16,$17,$18,
-                      $19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
+                      $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`,
               [
                 customerIdNum,
                 card_number,
@@ -2449,6 +2544,8 @@ router.post(
                 source_pst,
                 source_qst,
                 total_amount,
+                "sheet",
+                sourceRawJson,
               ]
             );
 
@@ -4014,7 +4111,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
          )
            t.*,
            COALESCE(c.customer_number, c_map.customer_number, card_map.customer_number) AS customer_number,
-           COALESCE(c.company_name, c_map.company_name, card_map.company_name) AS company_name
+           COALESCE(c.company_name, c_map.company_name, card_map.company_name, t.source_raw_json->>'Company Name', t.source_raw_json->>'company_name') AS company_name
          FROM transactions t
          LEFT JOIN customers c ON c.id = t.customer_id
          LEFT JOIN LATERAL (
@@ -4051,45 +4148,19 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
     );
 
     const rawColumns = new Set();
-    const normalizeRawKey = (key) =>
-      String(key || "")
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "_")
-        .replace(/^_+|_+$/g, "");
     const blockedRawColumns = new Set([
-      "amount",
-      "total",
-      "total_amount",
-      "card_number",
-      "driver_name",
-      "location",
-      "site_name",
-      "product",
-      "volume_liters",
-      "litres",
-      "liters",
-      "customer_number",
-      "company_name",
-      "document_number",
-      "purchase_datetime",
-      "transaction_date",
       "raw_line",
       "parser_mode",
       "numeric_tokens",
     ]);
     const rows = dataResult.rows.map((row) => {
       const raw = row?.source_raw_json && typeof row.source_raw_json === "object" ? row.source_raw_json : {};
-      const normalizedRaw = {};
       Object.entries(raw).forEach(([key, value]) => {
-        const normalizedKey = normalizeRawKey(key);
-        if (!normalizedKey || blockedRawColumns.has(normalizedKey)) return;
-        if (!Object.prototype.hasOwnProperty.call(normalizedRaw, normalizedKey) || normalizedRaw[normalizedKey] == null || normalizedRaw[normalizedKey] === "") {
-          normalizedRaw[normalizedKey] = value;
-        }
+        const keyName = String(key || "").trim();
+        if (!keyName || blockedRawColumns.has(keyName.toLowerCase())) return;
+        rawColumns.add(keyName);
       });
-      Object.keys(normalizedRaw).forEach((key) => rawColumns.add(key));
-      return { ...row, source_raw_json: normalizedRaw };
+      return { ...row, source_raw_json: raw };
     });
 
     return res.json({
