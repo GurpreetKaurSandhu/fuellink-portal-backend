@@ -1934,6 +1934,7 @@ router.post(
         let skipped = 0;
         let unmatched = 0;
         const unmatchedCards = new Set();
+        const rowErrors = [];
 
         await client.query("BEGIN");
 
@@ -1994,22 +1995,40 @@ router.post(
               ]
             );
             inserted += 1;
-          } catch (_rowErr) {
+          } catch (rowErr) {
             skipped += 1;
+            if (rowErrors.length < 25) {
+              rowErrors.push({
+                card_number: row?.card_number || null,
+                document_number: row?.document_number || null,
+                purchase_datetime: row?.purchase_datetime || null,
+                error: String(rowErr?.message || "row_insert_failed"),
+              });
+            }
           }
         }
 
         await client.query("COMMIT");
 
+        const parsedStatus = inserted > 0 ? "done" : "failed";
+        const parseError =
+          inserted > 0
+            ? null
+            : `No rows inserted. Sample row errors: ${rowErrors
+                .map((e) => e.error)
+                .filter(Boolean)
+                .slice(0, 3)
+                .join(" | ") || "Unknown row insert error"}`;
+
         await client.query(
           `UPDATE transaction_uploads
-           SET parse_status = 'done',
-               parse_error = NULL,
-               rows_inserted = $2,
-               rows_skipped = $3,
-               rows_unmatched = $4
+           SET parse_status = $2,
+               parse_error = $3,
+               rows_inserted = $4,
+               rows_skipped = $5,
+               rows_unmatched = $6
            WHERE id = $1`,
-          [uploadId, inserted, skipped, unmatched]
+          [uploadId, parsedStatus, parseError, inserted, skipped, unmatched]
         );
 
         summary.push({
@@ -2020,7 +2039,9 @@ router.post(
           rows_skipped: skipped,
           rows_unmatched: unmatched,
           unmatched_card_sample: Array.from(unmatchedCards).slice(0, 25),
-          parse_status: "done",
+          parse_status: parsedStatus,
+          ...(parseError ? { parse_error: parseError } : {}),
+          ...(rowErrors.length ? { row_error_sample: rowErrors } : {}),
         });
       } catch (err) {
         try {
@@ -4075,6 +4096,7 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
 router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase2Schema();
 
     const {
       date_from,
@@ -4159,7 +4181,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            ${resolvedCustomerExpr} AS resolved_customer_id,
            c.customer_number,
            c.company_name,
-           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+           COALESCE(rg.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
          LEFT JOIN LATERAL (
            SELECT cd.customer_id
@@ -4222,7 +4244,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            ${resolvedCustomerExpr} AS resolved_customer_id,
            c.customer_number,
            c.company_name,
-           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+           COALESCE(rg.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
          LEFT JOIN LATERAL (
            SELECT cd.customer_id
@@ -4312,8 +4334,9 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
       pageSize: pageSizeNum,
     });
   } catch (err) {
-    console.error("Admin customer-transactions-view error:", err);
-    return res.status(500).json({ message: "Server error" });
+    const errorId = `customer-tx-view-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    console.error(`[${errorId}] Admin customer-transactions-view error:`, err);
+    return res.status(500).json({ message: "Server error", errorId });
   }
 });
 
@@ -4373,7 +4396,7 @@ router.post("/customer-transactions-view/invoice", authMiddleware, async (req, r
            COALESCE(t.total_amount, 0)
          )
            t.*,
-           COALESCE(rg.markup_per_liter, t.markup_per_liter, 0) AS effective_markup_per_liter
+           COALESCE(rg.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
          JOIN customers c ON c.id = t.customer_id
          ${rateJoinSql}
@@ -4663,7 +4686,7 @@ router.post("/invoice-batches", authMiddleware, async (req, res) => {
 router.get("/invoice-batches", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
-    await ensureInvoiceBatchPhase1Schema();
+    await ensureInvoiceBatchPhase2Schema();
 
     const result = await pool.query(
       `SELECT
@@ -4690,7 +4713,7 @@ router.get("/invoice-batches", authMiddleware, async (req, res) => {
 router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
   try {
     if (!requireAdmin(req, res)) return;
-    await ensureInvoiceBatchPhase1Schema();
+    await ensureInvoiceBatchPhase2Schema();
 
     const batchId = parseInt(req.params.id, 10);
     if (!Number.isInteger(batchId) || batchId < 1) {
