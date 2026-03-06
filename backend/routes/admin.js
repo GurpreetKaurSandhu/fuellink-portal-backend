@@ -2036,24 +2036,37 @@ router.post(
             const total = Number.isFinite(row.amount) ? row.amount : getNumeric(raw.amount);
 
             if (hasExtendedPdfColumns) {
-              const sourceRawJson = { ...raw };
-              [
-                "fet",
-                "pft",
-                "pst",
-                "qst",
-                "city",
-                "amount",
-                "gst_hst",
-                "subtotal",
-                "base_rate",
-                "company_name",
-                "Company Name",
-                "rate_per_ltr",
-                "rate_per_liter",
-              ].forEach((key) => {
-                delete sourceRawJson[key];
-              });
+            const sourceRawJson = { ...raw };
+            const duplicateRawKeys = [
+              "fet",
+              "pft",
+              "pst",
+              "qst",
+              "city",
+              "amount",
+              "gst_hst",
+              "subtotal",
+              "base_rate",
+              "company_name",
+              "Company Name",
+              "rate_per_ltr",
+              "rate_per_liter",
+            ];
+            duplicateRawKeys.forEach((key) => {
+              delete sourceRawJson[key];
+            });
+            if (!hasExtendedPdfColumns) {
+              // Keep payload consistent on older schemas where extended columns do not exist.
+              sourceRawJson.company_name = raw.company_name ?? raw["Company Name"] ?? null;
+              sourceRawJson.city = raw.city ?? null;
+              sourceRawJson.rate_per_ltr = ratePerLtr;
+              sourceRawJson.base_rate = baseRate;
+              sourceRawJson.subtotal = subtotal;
+              sourceRawJson.gst_hst = gst;
+              sourceRawJson.pst = pst;
+              sourceRawJson.qst = qst;
+              sourceRawJson.amount = total;
+            }
 
               await client.query(
                 `INSERT INTO transactions
@@ -2109,7 +2122,7 @@ router.post(
                   row.driver_name,
                   uploadId,
                   "pdf",
-                  raw,
+                  sourceRawJson,
                 ]
               );
             }
@@ -4259,6 +4272,19 @@ router.get("/transactions/raw", authMiddleware, async (req, res) => {
       "raw_line",
       "parser_mode",
       "numeric_tokens",
+      "fet",
+      "pft",
+      "pst",
+      "qst",
+      "city",
+      "amount",
+      "gst_hst",
+      "subtotal",
+      "base_rate",
+      "company_name",
+      "company name",
+      "rate_per_ltr",
+      "rate_per_liter",
     ]);
     const rows = dataResult.rows.map((row) => {
       const raw = row?.source_raw_json && typeof row.source_raw_json === "object" ? row.source_raw_json : {};
