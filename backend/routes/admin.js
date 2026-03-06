@@ -2000,12 +2000,49 @@ router.post(
               continue;
             }
 
+            const raw = row && row.source_raw_json && typeof row.source_raw_json === "object"
+              ? row.source_raw_json
+              : {};
+            const getNumeric = (v) => {
+              const n = parseNumber(v);
+              return Number.isFinite(n) ? n : null;
+            };
+            const baseRate = getNumeric(raw.base_rate) ?? getNumeric(raw.ex_tax);
+            const fet = getNumeric(raw.fet) ?? getNumeric(raw.fet_per_liter);
+            const pft = getNumeric(raw.pft) ?? getNumeric(raw.pft_per_liter);
+            const ratePerLtr = getNumeric(raw.rate_per_ltr) ?? getNumeric(raw.rate_per_liter);
+            const subtotal = getNumeric(raw.subtotal);
+            const gst = getNumeric(raw.gst_hst) ?? getNumeric(raw.gst);
+            const pst = getNumeric(raw.pst);
+            const qst = getNumeric(raw.qst);
+            const total = Number.isFinite(row.amount) ? row.amount : getNumeric(raw.amount);
+
+            const sourceRawJson = { ...raw };
+            [
+              "fet",
+              "pft",
+              "pst",
+              "qst",
+              "city",
+              "amount",
+              "gst_hst",
+              "subtotal",
+              "base_rate",
+              "company_name",
+              "Company Name",
+              "rate_per_ltr",
+              "rate_per_liter",
+            ].forEach((key) => {
+              delete sourceRawJson[key];
+            });
+
             await client.query(
               `INSERT INTO transactions
                (customer_id, card_number, purchase_datetime, location, city, province, document_number, product,
-                volume_liters, total_amount, driver_name, source_upload_id, source_type, source_raw_json)
+                volume_liters, total_amount, driver_name, source_upload_id, source_type, source_raw_json,
+                base_rate, fet, pft, computed_rate_per_liter, subtotal, gst, pst, qst, total)
                VALUES
-               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
               [
                 customerId,
                 row.card_number,
@@ -2020,7 +2057,16 @@ router.post(
                 row.driver_name,
                 uploadId,
                 "pdf",
-                row.source_raw_json,
+                sourceRawJson,
+                baseRate,
+                fet,
+                pft,
+                ratePerLtr,
+                subtotal,
+                gst,
+                pst,
+                qst,
+                total,
               ]
             );
             inserted += 1;
