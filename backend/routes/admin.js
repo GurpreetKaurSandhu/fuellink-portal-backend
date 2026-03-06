@@ -2034,8 +2034,6 @@ router.post(
             const pst = getNumeric(raw.pst);
             const qst = getNumeric(raw.qst);
             const total = Number.isFinite(row.amount) ? row.amount : getNumeric(raw.amount);
-
-            if (hasExtendedPdfColumns) {
             const sourceRawJson = { ...raw };
             const duplicateRawKeys = [
               "fet",
@@ -2068,6 +2066,7 @@ router.post(
               sourceRawJson.amount = total;
             }
 
+            if (hasExtendedPdfColumns) {
               await client.query(
                 `INSERT INTO transactions
                  (customer_id, card_number, purchase_datetime, location, city, province, document_number, product,
