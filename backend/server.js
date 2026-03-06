@@ -366,7 +366,7 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
          d.purchase_datetime,
          d.card_number,
          d.driver_name,
-         d.customer_company_name AS company_name,
+         COALESCE(d.customer_company_name, d.source_raw_json->>'Company Name', d.source_raw_json->>'company_name') AS company_name,
          d.location,
          COALESCE(d.province, '') AS province,
          d.product,
@@ -391,13 +391,49 @@ app.get("/api/transactions", authMiddleware, async (req, res) => {
          ) AS computed_rate_per_liter,
          COALESCE(
            d.subtotal,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'subtotal', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'subtotal')::numeric
+             ELSE NULL
+           END,
            COALESCE(d.total, d.total_amount, 0) - COALESCE(d.gst, 0) - COALESCE(d.pst, 0) - COALESCE(d.qst, 0)
          ) AS subtotal,
-         COALESCE(d.gst, 0) AS gst,
-         COALESCE(d.pst, 0) AS pst,
-         COALESCE(d.qst, 0) AS qst,
+         COALESCE(
+           d.gst,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'gst_hst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'gst_hst')::numeric
+             WHEN COALESCE(d.source_raw_json->>'gst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'gst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS gst,
+         COALESCE(
+           d.pst,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'pst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'pst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS pst,
+         COALESCE(
+           d.qst,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'qst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'qst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS qst,
          COALESCE(
            d.total,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'amount')::numeric
+             ELSE NULL
+           END,
            d.total_amount,
            COALESCE(
              d.subtotal,
@@ -506,13 +542,49 @@ app.get("/api/transactions/export", authMiddleware, async (req, res) => {
          ) AS computed_rate_per_liter,
          COALESCE(
            d.subtotal,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'subtotal', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'subtotal')::numeric
+             ELSE NULL
+           END,
            COALESCE(d.total, d.total_amount, 0) - COALESCE(d.gst, 0) - COALESCE(d.pst, 0) - COALESCE(d.qst, 0)
          ) AS subtotal,
-         COALESCE(d.gst, 0) AS gst,
-         COALESCE(d.pst, 0) AS pst,
-         COALESCE(d.qst, 0) AS qst,
+         COALESCE(
+           d.gst,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'gst_hst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'gst_hst')::numeric
+             WHEN COALESCE(d.source_raw_json->>'gst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'gst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS gst,
+         COALESCE(
+           d.pst,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'pst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'pst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS pst,
+         COALESCE(
+           d.qst,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'qst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'qst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS qst,
          COALESCE(
            d.total,
+           CASE
+             WHEN COALESCE(d.source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (d.source_raw_json->>'amount')::numeric
+             ELSE NULL
+           END,
            d.total_amount,
            COALESCE(
              d.subtotal,

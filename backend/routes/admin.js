@@ -892,7 +892,7 @@ const parsePdfTransactionLines = (text) => {
     let i = 0;
     while (i < lines.length) {
       const start = String(lines[i] || "").trim();
-      if (!/^\d{4}/.test(start)) {
+      if (!/^\d{4}/.test(start) || /^20\d{2}[/-]\d{2}[/-]\d{2}\b/.test(start)) {
         i += 1;
         continue;
       }
@@ -1100,7 +1100,12 @@ const parsePdfTransactionLines = (text) => {
     let i = 0;
     while (i < lines.length) {
       const start = String(lines[i] || "").trim();
-      if (!start || isHeaderLine(start) || !/^\d{4}/.test(start)) {
+      if (
+        !start ||
+        isHeaderLine(start) ||
+        !/^\d{4}/.test(start) ||
+        /^20\d{2}[/-]\d{2}[/-]\d{2}\b/.test(start)
+      ) {
         i += 1;
         continue;
       }
@@ -1302,7 +1307,7 @@ const parsePdfTransactionLines = (text) => {
       let cardLineIdx = -1;
       for (let b = i - 1; b >= Math.max(0, i - 6); b -= 1) {
         const prev = String(lines[b] || "").trim();
-        if (/^\d{4}/.test(prev)) {
+        if (/^\d{4}/.test(prev) && !/^20\d{2}[/-]\d{2}[/-]\d{2}\b/.test(prev)) {
           cardLineIdx = b;
           break;
         }
@@ -1954,6 +1959,16 @@ router.post(
 
         for (const row of rows) {
           try {
+            const parsedDate = row?.purchase_datetime ? new Date(row.purchase_datetime) : null;
+            const purchaseYear =
+              parsedDate && !Number.isNaN(parsedDate.getTime())
+                ? String(parsedDate.getFullYear())
+                : null;
+            if (purchaseYear && String(row?.card_number || "").trim() === purchaseYear) {
+              skipped += 1;
+              continue;
+            }
+
             const customerId = await resolveCustomerIdByCard(client, row.card_number);
             if (!customerId) {
               unmatched += 1;
@@ -4265,7 +4280,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            t.*,
            ${resolvedCustomerExpr} AS resolved_customer_id,
            c.customer_number,
-           c.company_name,
+           COALESCE(c.company_name, t.source_raw_json->>'Company Name', t.source_raw_json->>'company_name') AS company_name,
            COALESCE(rg.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
          LEFT JOIN LATERAL (
@@ -4285,7 +4300,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            ORDER BY cd.id DESC
            LIMIT 1
          ) cm ON TRUE
-         JOIN customers c ON c.id = ${resolvedCustomerExpr}
+         LEFT JOIN customers c ON c.id = ${resolvedCustomerExpr}
          ${rateJoinSql}
          ${whereSql}
          ORDER BY
@@ -4303,9 +4318,19 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          COALESCE(SUM(
            COALESCE(
              total,
+             CASE
+               WHEN COALESCE(source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                 THEN (source_raw_json->>'amount')::numeric
+               ELSE NULL
+             END,
              total_amount,
              COALESCE(
                subtotal,
+               CASE
+                 WHEN COALESCE(source_raw_json->>'subtotal', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                   THEN (source_raw_json->>'subtotal')::numeric
+                 ELSE NULL
+               END,
                COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
              ) + COALESCE(gst, 0) + COALESCE(pst, 0) + COALESCE(qst, 0)
            )
@@ -4328,7 +4353,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            t.*,
            ${resolvedCustomerExpr} AS resolved_customer_id,
            c.customer_number,
-           c.company_name,
+           COALESCE(c.company_name, t.source_raw_json->>'Company Name', t.source_raw_json->>'company_name') AS company_name,
            COALESCE(rg.markup_per_liter, 0) AS effective_markup_per_liter
          FROM transactions t
          LEFT JOIN LATERAL (
@@ -4348,7 +4373,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            ORDER BY cd.id DESC
            LIMIT 1
          ) cm ON TRUE
-         JOIN customers c ON c.id = ${resolvedCustomerExpr}
+         LEFT JOIN customers c ON c.id = ${resolvedCustomerExpr}
          ${rateJoinSql}
          ${whereSql}
          ORDER BY
@@ -4369,7 +4394,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          card_number,
          document_number,
          location,
-         city,
+         COALESCE(city, source_raw_json->>'city') AS city,
          COALESCE(province, '') AS province,
          product,
          volume_liters,
@@ -4399,14 +4424,50 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          ) AS computed_rate_per_liter,
          COALESCE(
            subtotal,
+           CASE
+             WHEN COALESCE(source_raw_json->>'subtotal', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (source_raw_json->>'subtotal')::numeric
+             ELSE NULL
+           END,
            COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
          ) AS subtotal,
-         COALESCE(gst, 0) AS gst,
-         COALESCE(pst, 0) AS pst,
-         COALESCE(qst, 0) AS qst,
+         COALESCE(
+           gst,
+           CASE
+             WHEN COALESCE(source_raw_json->>'gst_hst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (source_raw_json->>'gst_hst')::numeric
+             WHEN COALESCE(source_raw_json->>'gst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (source_raw_json->>'gst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS gst,
+         COALESCE(
+           pst,
+           CASE
+             WHEN COALESCE(source_raw_json->>'pst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (source_raw_json->>'pst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS pst,
+         COALESCE(
+           qst,
+           CASE
+             WHEN COALESCE(source_raw_json->>'qst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (source_raw_json->>'qst')::numeric
+             ELSE NULL
+           END,
+           0
+         ) AS qst,
          COALESCE(driver_name, source_raw_json->>'driver_name') AS driver_name,
          COALESCE(
            total,
+           CASE
+             WHEN COALESCE(source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               THEN (source_raw_json->>'amount')::numeric
+             ELSE NULL
+           END,
            total_amount,
            COALESCE(
              subtotal,
