@@ -1954,6 +1954,24 @@ router.post(
         let unmatched = 0;
         const unmatchedCards = new Set();
         const rowErrors = [];
+        const txColumnsResult = await client.query(
+          `SELECT column_name
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'transactions'`
+        );
+        const txColumns = new Set((txColumnsResult.rows || []).map((r) => String(r.column_name || "").trim()));
+        const hasExtendedPdfColumns = [
+          "base_rate",
+          "fet",
+          "pft",
+          "computed_rate_per_liter",
+          "subtotal",
+          "gst",
+          "pst",
+          "qst",
+          "total",
+        ].every((column) => txColumns.has(column));
 
         await client.query("BEGIN");
 
@@ -2017,58 +2035,84 @@ router.post(
             const qst = getNumeric(raw.qst);
             const total = Number.isFinite(row.amount) ? row.amount : getNumeric(raw.amount);
 
-            const sourceRawJson = { ...raw };
-            [
-              "fet",
-              "pft",
-              "pst",
-              "qst",
-              "city",
-              "amount",
-              "gst_hst",
-              "subtotal",
-              "base_rate",
-              "company_name",
-              "Company Name",
-              "rate_per_ltr",
-              "rate_per_liter",
-            ].forEach((key) => {
-              delete sourceRawJson[key];
-            });
-
-            await client.query(
-              `INSERT INTO transactions
-               (customer_id, card_number, purchase_datetime, location, city, province, document_number, product,
-                volume_liters, total_amount, driver_name, source_upload_id, source_type, source_raw_json,
-                base_rate, fet, pft, computed_rate_per_liter, subtotal, gst, pst, qst, total)
-               VALUES
-               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+            if (hasExtendedPdfColumns) {
+              const sourceRawJson = { ...raw };
               [
-                customerId,
-                row.card_number,
-                row.purchase_datetime,
-                row.location,
-                row.city,
-                row.province,
-                row.document_number,
-                row.product,
-                row.volume_liters,
-                row.amount,
-                row.driver_name,
-                uploadId,
-                "pdf",
-                sourceRawJson,
-                baseRate,
-                fet,
-                pft,
-                ratePerLtr,
-                subtotal,
-                gst,
-                pst,
-                qst,
-                total,
-              ]
-            );
+                "fet",
+                "pft",
+                "pst",
+                "qst",
+                "city",
+                "amount",
+                "gst_hst",
+                "subtotal",
+                "base_rate",
+                "company_name",
+                "Company Name",
+                "rate_per_ltr",
+                "rate_per_liter",
+              ].forEach((key) => {
+                delete sourceRawJson[key];
+              });
+
+              await client.query(
+                `INSERT INTO transactions
+                 (customer_id, card_number, purchase_datetime, location, city, province, document_number, product,
+                  volume_liters, total_amount, driver_name, source_upload_id, source_type, source_raw_json,
+                  base_rate, fet, pft, computed_rate_per_liter, subtotal, gst, pst, qst, total)
+                 VALUES
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+                [
+                  customerId,
+                  row.card_number,
+                  row.purchase_datetime,
+                  row.location,
+                  row.city,
+                  row.province,
+                  row.document_number,
+                  row.product,
+                  row.volume_liters,
+                  row.amount,
+                  row.driver_name,
+                  uploadId,
+                  "pdf",
+                  sourceRawJson,
+                  baseRate,
+                  fet,
+                  pft,
+                  ratePerLtr,
+                  subtotal,
+                  gst,
+                  pst,
+                  qst,
+                  total,
+                ]
+              );
+            } else {
+              await client.query(
+                `INSERT INTO transactions
+                 (customer_id, card_number, purchase_datetime, location, city, province, document_number, product,
+                  volume_liters, total_amount, driver_name, source_upload_id, source_type, source_raw_json)
+                 VALUES
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+                [
+                  customerId,
+                  row.card_number,
+                  row.purchase_datetime,
+                  row.location,
+                  row.city,
+                  row.province,
+                  row.document_number,
+                  row.product,
+                  row.volume_liters,
+                  row.amount,
+                  row.driver_name,
+                  uploadId,
+                  "pdf",
+                  raw,
+                ]
+              );
+            }
             inserted += 1;
           } catch (rowErr) {
             skipped += 1;
