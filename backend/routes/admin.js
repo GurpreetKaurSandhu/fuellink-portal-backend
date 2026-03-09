@@ -1752,6 +1752,35 @@ const resolveCustomerIdByCompanyName = async (client, rawCompanyName) => {
     .trim();
   if (!normalized) return null;
 
+  // If uploaded company starts with customer number (e.g. "5312 (...)"), prefer direct customer_number match.
+  const numberPrefixMatch = company.match(/^\s*(\d{3,12})\b/);
+  if (numberPrefixMatch) {
+    const customerNum = String(numberPrefixMatch[1] || "").trim();
+    if (customerNum) {
+      const byCustomerNumber = await client.query(
+        `SELECT id
+         FROM customers
+         WHERE customer_number IS NOT NULL
+           AND regexp_replace(customer_number, '\\D', '', 'g') = regexp_replace($1, '\\D', '', 'g')
+         ORDER BY id DESC
+         LIMIT 5`,
+        [customerNum]
+      );
+      const uniqueByNumber = [...new Set(byCustomerNumber.rows.map((r) => r.id).filter(Boolean))];
+      if (uniqueByNumber.length === 1) return uniqueByNumber[0];
+    }
+  }
+
+  // Handle "O/A" aliases by comparing both full legal name and operating-as part.
+  const aliasParts = company.split(/\bO\/?A\b/i).map((p) => String(p || "").trim()).filter(Boolean);
+  const aliasRaw = aliasParts.length > 1 ? aliasParts[aliasParts.length - 1] : company;
+  const aliasNormalized = aliasRaw
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
   const result = await client.query(
     `SELECT id
      FROM customers
@@ -1759,10 +1788,15 @@ const resolveCustomerIdByCompanyName = async (client, rawCompanyName) => {
        AND (
          lower(trim(company_name)) = lower(trim($1))
          OR regexp_replace(lower(company_name), '[^a-z0-9]+', ' ', 'g') = $2
+         OR regexp_replace(lower(company_name), '[^a-z0-9]+', ' ', 'g') = $3
+         OR regexp_replace(lower(company_name), '[^a-z0-9]+', ' ', 'g') LIKE '%' || $3 || '%'
+         OR $3 LIKE '%' || regexp_replace(lower(company_name), '[^a-z0-9]+', ' ', 'g') || '%'
+         OR regexp_replace(lower(company_name), '[^a-z0-9]+', ' ', 'g') LIKE '%' || $2 || '%'
+         OR $2 LIKE '%' || regexp_replace(lower(company_name), '[^a-z0-9]+', ' ', 'g') || '%'
        )
      ORDER BY id DESC
      LIMIT 10`,
-    [company, normalized]
+    [company, normalized, aliasNormalized]
   );
 
   if (!result.rows.length) return null;
@@ -5043,27 +5077,46 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ message: "Batch not found" });
     }
 
+    const [ibtColsResult, txColsResult] = await Promise.all([
+      pool.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'invoice_batch_transactions'`
+      ),
+      pool.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'transactions'`
+      ),
+    ]);
+    const ibtCols = new Set((ibtColsResult.rows || []).map((r) => String(r.column_name || "").trim()));
+    const txCols = new Set((txColsResult.rows || []).map((r) => String(r.column_name || "").trim()));
+    const ibtCol = (name) => (ibtCols.has(name) ? `ibt.${name}` : "NULL");
+    const txCol = (name) => (txCols.has(name) ? `t.${name}` : "NULL");
+
     const rowsResult = await pool.query(
       `SELECT
          ibt.id AS batch_line_id,
          ibt.line_status,
          ibt.issue_note,
-         ibt.rate_group_id,
-         ibt.rate_group_name,
-         ibt.rate_source_effective_date,
-         ibt.base_rate,
-         ibt.markup_rule_id,
-         ibt.markup_rule_used,
-         ibt.markup_type,
-         ibt.markup_value,
-         ibt.rate_per_ltr,
-         ibt.subtotal,
-         ibt.gst,
-         ibt.pst,
-         ibt.qst,
-         ibt.amount_total,
-         ibt.markup_checked,
-         ibt.flags,
+         ${ibtCol("rate_group_id")} AS rate_group_id,
+         ${ibtCol("rate_group_name")} AS rate_group_name,
+         ${ibtCol("rate_source_effective_date")} AS rate_source_effective_date,
+         ${ibtCol("base_rate")} AS base_rate,
+         ${ibtCol("markup_rule_id")} AS markup_rule_id,
+         ${ibtCol("markup_rule_used")} AS markup_rule_used,
+         ${ibtCol("markup_type")} AS markup_type,
+         ${ibtCol("markup_value")} AS markup_value,
+         ${ibtCol("rate_per_ltr")} AS rate_per_ltr,
+         ${ibtCol("subtotal")} AS subtotal,
+         ${ibtCol("gst")} AS gst,
+         ${ibtCol("pst")} AS pst,
+         ${ibtCol("qst")} AS qst,
+         ${ibtCol("amount_total")} AS amount_total,
+         COALESCE(${ibtCol("markup_checked")}, false) AS markup_checked,
+         COALESCE(${ibtCol("flags")}, ARRAY[]::TEXT[]) AS flags,
          t.id AS transaction_id,
          t.customer_id,
          c.customer_number,
@@ -5075,12 +5128,12 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
          t.province,
          t.product,
          t.volume_liters,
-         t.fet,
-         t.pft,
+         ${txCol("fet")} AS fet,
+         ${txCol("pft")} AS pft,
          t.driver_name,
-         COALESCE(t.total, t.total_amount, 0) AS total_amount,
+         COALESCE(${txCol("total")}, t.total_amount, 0) AS total_amount,
          t.document_number,
-         COALESCE(t.is_invoiced, false) AS is_invoiced
+         COALESCE(${txCol("is_invoiced")}, false) AS is_invoiced
        FROM invoice_batch_transactions ibt
        JOIN transactions t ON t.id = ibt.transaction_id
        LEFT JOIN customers c ON c.id = t.customer_id
