@@ -1740,6 +1740,37 @@ const resolveCustomerIdByCard = async (client, rawCardNumber) => {
   return uniqueCustomers[0];
 };
 
+const resolveCustomerIdByCompanyName = async (client, rawCompanyName) => {
+  const company = String(rawCompanyName || "").trim();
+  if (!company) return null;
+
+  const normalized = company
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+
+  const result = await client.query(
+    `SELECT id
+     FROM customers
+     WHERE company_name IS NOT NULL
+       AND (
+         lower(trim(company_name)) = lower(trim($1))
+         OR regexp_replace(lower(company_name), '[^a-z0-9]+', ' ', 'g') = $2
+       )
+     ORDER BY id DESC
+     LIMIT 10`,
+    [company, normalized]
+  );
+
+  if (!result.rows.length) return null;
+  const uniqueCustomers = [...new Set(result.rows.map((r) => r.id).filter(Boolean))];
+  if (uniqueCustomers.length !== 1) return null;
+  return uniqueCustomers[0];
+};
+
 
 
 
@@ -1987,7 +2018,15 @@ router.post(
               continue;
             }
 
-            const customerId = await resolveCustomerIdByCard(client, row.card_number);
+            const raw = row && row.source_raw_json && typeof row.source_raw_json === "object"
+              ? row.source_raw_json
+              : {};
+            const sourceCompanyName = raw.company_name || raw["Company Name"] || null;
+
+            let customerId = await resolveCustomerIdByCard(client, row.card_number);
+            if (!customerId && sourceCompanyName) {
+              customerId = await resolveCustomerIdByCompanyName(client, sourceCompanyName);
+            }
             if (!customerId) {
               unmatched += 1;
               if (row.card_number) unmatchedCards.add(String(row.card_number));
@@ -2018,9 +2057,6 @@ router.post(
               continue;
             }
 
-            const raw = row && row.source_raw_json && typeof row.source_raw_json === "object"
-              ? row.source_raw_json
-              : {};
             const getNumeric = (v) => {
               const n = parseNumber(v);
               return Number.isFinite(n) ? n : null;
@@ -4365,6 +4401,14 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const txColumnsResult = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'transactions'`
+    );
+    const txColumns = new Set((txColumnsResult.rows || []).map((r) => String(r.column_name || "").trim()));
+    const txCol = (name) => (txColumns.has(name) ? name : "NULL");
     const assignmentsExistsResult = await pool.query(
       `SELECT to_regclass('public.customer_rate_group_assignments') IS NOT NULL AS exists`
     );
@@ -4432,7 +4476,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          COALESCE(SUM(volume_liters), 0) AS total_litres,
          COALESCE(SUM(
            COALESCE(
-             total,
+             ${txCol("total")},
              CASE
                WHEN COALESCE(source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                  THEN (source_raw_json->>'amount')::numeric
@@ -4440,14 +4484,14 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
              END,
              total_amount,
              COALESCE(
-               subtotal,
+               ${txCol("subtotal")},
                CASE
                  WHEN COALESCE(source_raw_json->>'subtotal', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                    THEN (source_raw_json->>'subtotal')::numeric
                  ELSE NULL
                END,
-               COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
-             ) + COALESCE(gst, 0) + COALESCE(pst, 0) + COALESCE(qst, 0)
+               COALESCE(${txCol("total")}, total_amount, 0) - COALESCE(${txCol("gst")}, 0) - COALESCE(${txCol("pst")}, 0) - COALESCE(${txCol("qst")}, 0)
+             ) + COALESCE(${txCol("gst")}, 0) + COALESCE(${txCol("pst")}, 0) + COALESCE(${txCol("qst")}, 0)
            )
          ), 0) AS total_amount
        FROM deduped`,
@@ -4514,14 +4558,14 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          product,
          volume_liters,
          COALESCE(
-           base_rate,
+           ${txCol("base_rate")},
            NULLIF(source_raw_json->>'base_rate', '')::numeric,
            NULLIF(source_raw_json->>'ex_tax', '')::numeric
          )::numeric AS base_rate,
-         COALESCE(fet, NULLIF(source_raw_json->>'fet', '')::numeric, NULLIF(source_raw_json->>'fet_per_liter', '')::numeric)::numeric AS fet,
-         COALESCE(pft, NULLIF(source_raw_json->>'pft', '')::numeric, NULLIF(source_raw_json->>'pft_per_liter', '')::numeric)::numeric AS pft,
+         COALESCE(${txCol("fet")}, NULLIF(source_raw_json->>'fet', '')::numeric, NULLIF(source_raw_json->>'fet_per_liter', '')::numeric)::numeric AS fet,
+         COALESCE(${txCol("pft")}, NULLIF(source_raw_json->>'pft', '')::numeric, NULLIF(source_raw_json->>'pft_per_liter', '')::numeric)::numeric AS pft,
         COALESCE(
-          computed_rate_per_liter,
+          ${txCol("computed_rate_per_liter")},
           CASE
             WHEN COALESCE(source_raw_json->>'rate_per_ltr', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
               THEN (source_raw_json->>'rate_per_ltr')::numeric
@@ -4531,23 +4575,23 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
           END,
           CASE
             WHEN COALESCE(volume_liters, 0) > 0 THEN ROUND(
-              (COALESCE(subtotal, total, total_amount, 0) / volume_liters) + COALESCE(effective_markup_per_liter, 0),
+              (COALESCE(${txCol("subtotal")}, ${txCol("total")}, total_amount, 0) / volume_liters) + COALESCE(effective_markup_per_liter, 0),
                4
              )
              ELSE NULL
            END
          ) AS computed_rate_per_liter,
          COALESCE(
-           subtotal,
+           ${txCol("subtotal")},
            CASE
              WHEN COALESCE(source_raw_json->>'subtotal', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                THEN (source_raw_json->>'subtotal')::numeric
              ELSE NULL
            END,
-           COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
+           COALESCE(${txCol("total")}, total_amount, 0) - COALESCE(${txCol("gst")}, 0) - COALESCE(${txCol("pst")}, 0) - COALESCE(${txCol("qst")}, 0)
          ) AS subtotal,
          COALESCE(
-           gst,
+           ${txCol("gst")},
            CASE
              WHEN COALESCE(source_raw_json->>'gst_hst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                THEN (source_raw_json->>'gst_hst')::numeric
@@ -4558,7 +4602,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            0
          ) AS gst,
          COALESCE(
-           pst,
+           ${txCol("pst")},
            CASE
              WHEN COALESCE(source_raw_json->>'pst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                THEN (source_raw_json->>'pst')::numeric
@@ -4567,7 +4611,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            0
          ) AS pst,
          COALESCE(
-           qst,
+           ${txCol("qst")},
            CASE
              WHEN COALESCE(source_raw_json->>'qst', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                THEN (source_raw_json->>'qst')::numeric
@@ -4577,7 +4621,7 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
          ) AS qst,
          COALESCE(driver_name, source_raw_json->>'driver_name') AS driver_name,
          COALESCE(
-           total,
+           ${txCol("total")},
            CASE
              WHEN COALESCE(source_raw_json->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                THEN (source_raw_json->>'amount')::numeric
@@ -4585,9 +4629,9 @@ router.get("/customer-transactions-view", authMiddleware, async (req, res) => {
            END,
            total_amount,
            COALESCE(
-             subtotal,
-             COALESCE(total, total_amount, 0) - COALESCE(gst, 0) - COALESCE(pst, 0) - COALESCE(qst, 0)
-           ) + COALESCE(gst, 0) + COALESCE(pst, 0) + COALESCE(qst, 0)
+             ${txCol("subtotal")},
+             COALESCE(${txCol("total")}, total_amount, 0) - COALESCE(${txCol("gst")}, 0) - COALESCE(${txCol("pst")}, 0) - COALESCE(${txCol("qst")}, 0)
+           ) + COALESCE(${txCol("gst")}, 0) + COALESCE(${txCol("pst")}, 0) + COALESCE(${txCol("qst")}, 0)
          ) AS total
        FROM deduped
        ORDER BY purchase_datetime DESC NULLS LAST, id DESC
