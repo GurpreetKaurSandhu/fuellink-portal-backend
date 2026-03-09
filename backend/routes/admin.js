@@ -4961,8 +4961,8 @@ router.post("/invoice-batches", authMiddleware, async (req, res) => {
     }
 
     await client.query("BEGIN");
-    const txResult = await client.query(
-      `SELECT id, customer_id, purchase_datetime, COALESCE(is_invoiced, false) AS is_invoiced, invoice_batch_id
+    let txResult = await client.query(
+      `SELECT id, customer_id, card_number, source_raw_json, purchase_datetime, COALESCE(is_invoiced, false) AS is_invoiced, invoice_batch_id
        FROM transactions
        WHERE id = ANY($1::bigint[])
        ORDER BY id ASC`,
@@ -4973,6 +4973,36 @@ router.post("/invoice-batches", authMiddleware, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "One or more transaction_ids do not exist" });
     }
+
+    // Auto-map blank customers by card/company before validation.
+    for (const row of txResult.rows) {
+      if (Number.isInteger(row.customer_id) && row.customer_id > 0) continue;
+      let resolvedCustomerId = await resolveCustomerIdByCard(client, row.card_number);
+      if (!resolvedCustomerId) {
+        const raw = row?.source_raw_json && typeof row.source_raw_json === "object" ? row.source_raw_json : {};
+        const companyName = raw.company_name || raw["Company Name"] || null;
+        if (companyName) {
+          resolvedCustomerId = await resolveCustomerIdByCompanyName(client, companyName);
+        }
+      }
+      if (resolvedCustomerId) {
+        await client.query(
+          `UPDATE transactions
+           SET customer_id = $1
+           WHERE id = $2
+             AND customer_id IS NULL`,
+          [resolvedCustomerId, row.id]
+        );
+      }
+    }
+
+    txResult = await client.query(
+      `SELECT id, customer_id, card_number, source_raw_json, purchase_datetime, COALESCE(is_invoiced, false) AS is_invoiced, invoice_batch_id
+       FROM transactions
+       WHERE id = ANY($1::bigint[])
+       ORDER BY id ASC`,
+      [txIds]
+    );
 
     const alreadyInvoiced = txResult.rows.filter((row) => row.is_invoiced);
     if (alreadyInvoiced.length > 0) {
@@ -5208,6 +5238,70 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
   }
 });
 
+router.delete("/invoice-batches/:id", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!requireAdmin(req, res)) return;
+    await ensureInvoiceBatchPhase1Schema();
+
+    const batchId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(batchId) || batchId < 1) {
+      return res.status(400).json({ message: "Invalid batch id" });
+    }
+
+    await client.query("BEGIN");
+    const batchResult = await client.query(
+      `SELECT id, status
+       FROM invoice_batches
+       WHERE id = $1
+       LIMIT 1`,
+      [batchId]
+    );
+    if (batchResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Batch not found" });
+    }
+    if (String(batchResult.rows[0]?.status || "").toUpperCase() === "INVOICED") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "Cannot delete an invoiced batch" });
+    }
+
+    await client.query(
+      `UPDATE transactions t
+       SET invoice_batch_id = NULL
+       FROM invoice_batch_transactions ibt
+       WHERE ibt.invoice_batch_id = $1
+         AND ibt.transaction_id = t.id`,
+      [batchId]
+    );
+    const deleteLines = await client.query(
+      `DELETE FROM invoice_batch_transactions
+       WHERE invoice_batch_id = $1`,
+      [batchId]
+    );
+    await client.query(
+      `DELETE FROM invoice_batches
+       WHERE id = $1`,
+      [batchId]
+    );
+
+    await client.query("COMMIT");
+    return res.json({
+      message: "Batch deleted",
+      batch_id: batchId,
+      deleted_lines: deleteLines.rowCount || 0,
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackErr) {}
+    console.error("Delete invoice batch error:", err);
+    return res.status(500).json({ message: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
 router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -5382,23 +5476,41 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
           }
 
           if (flags.length === 0) {
-            if (markup.markup_type === "percent") {
-              const baseWithMarkup = base * (1 + (Number(markup.markup_value) || 0) / 100);
-              finalRate = round4(baseWithMarkup + (isDslLs ? (fetPerLtr + pftPerLtr) : 0));
+            const raw = row?.source_raw_json && typeof row.source_raw_json === "object"
+              ? row.source_raw_json
+              : {};
+            // Keep non-DSL rows aligned with uploaded values for cross-checking.
+            if (!isDslLs) {
+              const srcRate = parseNumber(raw.rate_per_ltr) ?? parseNumber(raw.rate_per_liter);
+              const srcSubtotal = parseNumber(raw.subtotal);
+              const srcGst = parseNumber(raw.gst_hst) ?? parseNumber(raw.gst);
+              const srcPst = parseNumber(raw.pst);
+              const srcQst = parseNumber(raw.qst);
+              const srcTotal = parseNumber(raw.amount) ?? parseNumber(row.total_amount);
+              if (Number.isFinite(srcRate)) finalRate = round4(srcRate);
+              if (Number.isFinite(srcSubtotal)) subtotal = round4(srcSubtotal);
+              if (Number.isFinite(srcGst)) gst = round4(srcGst); else gst = 0;
+              if (Number.isFinite(srcPst)) pst = round4(srcPst); else pst = 0;
+              if (Number.isFinite(srcQst)) qst = round4(srcQst); else qst = 0;
+              if (Number.isFinite(srcTotal)) {
+                total = round4(srcTotal);
+              } else if (Number.isFinite(subtotal)) {
+                total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
+              }
             } else {
-              finalRate = round4(
-                base +
-                (isDslLs ? (fetPerLtr + pftPerLtr) : 0) +
-                (Number(markup.markup_value) || 0)
-              );
+              if (markup.markup_type === "percent") {
+                const baseWithMarkup = base * (1 + (Number(markup.markup_value) || 0) / 100);
+                finalRate = round4(baseWithMarkup + (fetPerLtr + pftPerLtr));
+              } else {
+                finalRate = round4(base + fetPerLtr + pftPerLtr + (Number(markup.markup_value) || 0));
+              }
+              subtotal = round4(volume * (finalRate || 0));
+              const taxes = await getTaxRatesForTx(client, row.province, row.purchase_datetime || txDate);
+              gst = round4((subtotal || 0) * (Number(taxes.gst_rate) || 0));
+              pst = round4((subtotal || 0) * (Number(taxes.pst_rate) || 0));
+              qst = round4((subtotal || 0) * (Number(taxes.qst_rate) || 0));
+              total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
             }
-
-            subtotal = round4(volume * (finalRate || 0));
-            const taxes = await getTaxRatesForTx(client, row.province, row.purchase_datetime || txDate);
-            gst = round4((subtotal || 0) * (Number(taxes.gst_rate) || 0));
-            pst = round4((subtotal || 0) * (Number(taxes.pst_rate) || 0));
-            qst = round4((subtotal || 0) * (Number(taxes.qst_rate) || 0));
-            total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
           }
         }
       } catch (err) {
