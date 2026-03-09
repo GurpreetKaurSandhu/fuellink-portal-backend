@@ -5207,7 +5207,7 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
            0
          ) AS pft,
          t.driver_name,
-         COALESCE(${txCol("total")}, t.total_amount, 0) AS total_amount,
+         COALESCE(${ibtCol("amount_total")}, ${txCol("total")}, t.total_amount, 0) AS total_amount,
          t.document_number,
          COALESCE(${txCol("is_invoiced")}, false) AS is_invoiced
        FROM invoice_batch_transactions ibt
@@ -5386,24 +5386,23 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
             .trim();
           const isDslLs = normalizedProduct === "DSL-LS" || normalizedProduct === "DSLLS";
 
-          rateGroup = await getEffectiveRateGroupForTx(client, row.customer_id, txDate);
-          if (isDslLs && (!rateGroup?.rate_group_id || rateGroup?.is_ready === false)) {
-            flags.push("RATE_MISSING");
-          }
-
-          baseRate = await getBaseRateForTx(client, {
-            txDate,
-            location: row.location,
-            province: row.province,
-          });
-          if (!baseRate?.base_price) {
-            flags.push("RATE_MISSING");
-          } else {
-            effectiveDate = baseRate.effective_date || null;
-          }
-
-          // Use simple customer rate-group markup only for DSL-LS rows.
           if (isDslLs) {
+            rateGroup = await getEffectiveRateGroupForTx(client, row.customer_id, txDate);
+            if (!rateGroup?.rate_group_id || rateGroup?.is_ready === false) {
+              flags.push("RATE_MISSING");
+            }
+
+            baseRate = await getBaseRateForTx(client, {
+              txDate,
+              location: row.location,
+              province: row.province,
+            });
+            if (!baseRate?.base_price) {
+              flags.push("RATE_MISSING");
+            } else {
+              effectiveDate = baseRate.effective_date || null;
+            }
+
             if (Number.isFinite(Number(rateGroup?.markup_per_liter))) {
               markup = {
                 markup_rule_id: null,
@@ -5411,6 +5410,9 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
                 markup_type: "per_liter",
                 markup_value: Number(rateGroup.markup_per_liter) || 0,
               };
+            }
+            if (!markup) {
+              flags.push("MARKUP_MISSING");
             }
           } else {
             markup = {
@@ -5420,13 +5422,10 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
               markup_value: 0,
             };
           }
-          if (!markup) {
-            flags.push("MARKUP_MISSING");
-          }
 
           let fetPerLtr = 0;
           let pftPerLtr = 0;
-          if (flags.length === 0) {
+          if (flags.length === 0 && isDslLs) {
             base = Number(baseRate?.base_price);
             const raw = row?.source_raw_json && typeof row.source_raw_json === "object"
               ? row.source_raw_json
