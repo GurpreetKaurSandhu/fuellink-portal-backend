@@ -5104,6 +5104,7 @@ router.get("/invoice-batches", authMiddleware, async (req, res) => {
          b.id,
          b.batch_code,
          b.status,
+         CASE WHEN UPPER(COALESCE(b.status, '')) = 'INVOICED' THEN false ELSE true END AS can_delete,
          b.date_from,
          b.date_to,
          b.created_at,
@@ -5228,7 +5229,10 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
     );
 
     return res.json({
-      batch: batchResult.rows[0],
+      batch: {
+        ...batchResult.rows[0],
+        can_delete: String(batchResult.rows[0]?.status || "").toUpperCase() !== "INVOICED",
+      },
       rows: rowsResult.rows,
       totals,
     });
