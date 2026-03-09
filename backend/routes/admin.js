@@ -122,6 +122,14 @@ const round4 = (value) => {
   if (value == null || !Number.isFinite(value)) return null;
   return Math.round(value * 10000) / 10000;
 };
+const toLocalDateOnly = (value) => {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
 
 const parseBooleanish = (value, fallback = true) => {
   if (value == null) return fallback;
@@ -4920,9 +4928,36 @@ router.post("/invoice-batches", authMiddleware, async (req, res) => {
     await ensureInvoiceBatchPhase1Schema();
 
     const inputIds = Array.isArray(req.body?.transaction_ids) ? req.body.transaction_ids : [];
-    const txIds = [...new Set(inputIds.map((id) => parseInt(id, 10)).filter((id) => Number.isInteger(id) && id > 0))];
+    let txIds = [...new Set(inputIds.map((id) => parseInt(id, 10)).filter((id) => Number.isInteger(id) && id > 0))];
+
+    // Alternate mode: build batch by customer + date range (all matching rows, not page-limited).
     if (txIds.length === 0) {
-      return res.status(400).json({ message: "transaction_ids is required" });
+      const customerIdNum = parseInt(req.body?.customer_id, 10);
+      const dateFrom = parseDateOnly(req.body?.date_from);
+      const dateTo = parseDateOnly(req.body?.date_to);
+      if (!Number.isInteger(customerIdNum) || customerIdNum < 1 || !dateFrom || !dateTo) {
+        return res.status(400).json({
+          message: "Provide transaction_ids or customer_id + date_from + date_to",
+        });
+      }
+
+      const filteredResult = await client.query(
+        `SELECT id
+         FROM transactions
+         WHERE customer_id = $1
+           AND purchase_datetime >= $2::date
+           AND purchase_datetime < ($3::date + INTERVAL '1 day')
+           AND COALESCE(is_invoiced, false) = false
+           AND invoice_batch_id IS NULL
+         ORDER BY purchase_datetime ASC NULLS LAST, id ASC`,
+        [customerIdNum, dateFrom, dateTo]
+      );
+      txIds = filteredResult.rows.map((row) => Number(row.id)).filter((v) => Number.isInteger(v) && v > 0);
+      if (txIds.length === 0) {
+        return res.status(400).json({
+          message: "No uninvoiced and unbatched transactions found for selected customer/date range",
+        });
+      }
     }
 
     await client.query("BEGIN");
@@ -5128,8 +5163,18 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
          t.province,
          t.product,
          t.volume_liters,
-         ${txCol("fet")} AS fet,
-         ${txCol("pft")} AS pft,
+         COALESCE(
+           ${txCol("fet")},
+           NULLIF(t.source_raw_json->>'fet', '')::numeric,
+           NULLIF(t.source_raw_json->>'fet_per_liter', '')::numeric,
+           0
+         ) AS fet,
+         COALESCE(
+           ${txCol("pft")},
+           NULLIF(t.source_raw_json->>'pft', '')::numeric,
+           NULLIF(t.source_raw_json->>'pft_per_liter', '')::numeric,
+           0
+         ) AS pft,
          t.driver_name,
          COALESCE(${txCol("total")}, t.total_amount, 0) AS total_amount,
          t.document_number,
@@ -5191,7 +5236,9 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
          t.location,
          t.province,
          t.product,
-         t.volume_liters
+         t.volume_liters,
+         t.total_amount,
+         t.source_raw_json
        FROM invoice_batch_transactions ibt
        JOIN transactions t ON t.id = ibt.transaction_id
        WHERE ibt.invoice_batch_id = $1
@@ -5215,12 +5262,13 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
       let issueNote = null;
 
       const txDate = row.purchase_datetime
-        ? new Date(row.purchase_datetime).toISOString().slice(0, 10)
+        ? toLocalDateOnly(row.purchase_datetime)
         : null;
       const volume = Number(row.volume_liters) || 0;
 
       let rateGroup = null;
       let baseRate = null;
+      let base = null;
       let markup = null;
       let finalRate = null;
       let subtotal = null;
@@ -5234,8 +5282,14 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
         if (!row.customer_id || !txDate) {
           flags.push("ERROR");
         } else {
+          const normalizedProduct = String(row.product || "")
+            .toUpperCase()
+            .replace(/\s+/g, "")
+            .trim();
+          const isDslLs = normalizedProduct === "DSL-LS" || normalizedProduct === "DSLLS";
+
           rateGroup = await getEffectiveRateGroupForTx(client, row.customer_id, txDate);
-          if (!rateGroup?.rate_group_id || rateGroup?.is_ready === false) {
+          if (isDslLs && (!rateGroup?.rate_group_id || rateGroup?.is_ready === false)) {
             flags.push("RATE_MISSING");
           }
 
@@ -5250,24 +5304,93 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
             effectiveDate = baseRate.effective_date || null;
           }
 
-          markup = await findBestMarkupRule(client, {
-            customerId: row.customer_id,
-            product: row.product,
-            province: row.province,
-            location: row.location,
-            txDate,
-            fallbackMarkup: rateGroup?.markup_per_liter,
-          });
+          // Use simple customer rate-group markup only for DSL-LS rows.
+          if (isDslLs) {
+            if (Number.isFinite(Number(rateGroup?.markup_per_liter))) {
+              markup = {
+                markup_rule_id: null,
+                markup_rule_used: "RATE_GROUP_SIMPLE",
+                markup_type: "per_liter",
+                markup_value: Number(rateGroup.markup_per_liter) || 0,
+              };
+            }
+          } else {
+            markup = {
+              markup_rule_id: null,
+              markup_rule_used: "NON_DSL_NO_MARKUP",
+              markup_type: "per_liter",
+              markup_value: 0,
+            };
+          }
           if (!markup) {
             flags.push("MARKUP_MISSING");
           }
 
+          let fetPerLtr = 0;
+          let pftPerLtr = 0;
           if (flags.length === 0) {
-            const base = Number(baseRate.base_price) || 0;
+            base = Number(baseRate?.base_price);
+            const raw = row?.source_raw_json && typeof row.source_raw_json === "object"
+              ? row.source_raw_json
+              : {};
+            fetPerLtr = parseNumber(raw.fet) ?? parseNumber(raw.fet_per_liter) ?? 0;
+            pftPerLtr = parseNumber(raw.pft) ?? parseNumber(raw.pft_per_liter) ?? 0;
+            if (!Number.isFinite(base) || base <= 0) {
+              base = parseNumber(raw.base_rate);
+            }
+            if (!Number.isFinite(base) || base <= 0) {
+              base = parseNumber(raw.ex_tax);
+            }
+            if ((!Number.isFinite(base) || base <= 0) && volume > 0) {
+              const srcRate = parseNumber(raw.rate_per_ltr) ?? parseNumber(raw.rate_per_liter);
+              if (Number.isFinite(srcRate)) {
+                if (markup.markup_type === "percent") {
+                  const pct = Number(markup.markup_value) || 0;
+                  base = pct === -100 ? null : srcRate / (1 + (pct / 100));
+                } else {
+                  base = srcRate - (Number(markup.markup_value) || 0);
+                }
+              }
+            }
+            if ((!Number.isFinite(base) || base <= 0) && volume > 0) {
+              const srcSubtotal = parseNumber(raw.subtotal);
+              if (Number.isFinite(srcSubtotal)) {
+                const srcRate = srcSubtotal / volume;
+                if (markup.markup_type === "percent") {
+                  const pct = Number(markup.markup_value) || 0;
+                  base = pct === -100 ? null : srcRate / (1 + (pct / 100));
+                } else {
+                  base = srcRate - (Number(markup.markup_value) || 0);
+                }
+              }
+            }
+            if ((!Number.isFinite(base) || base <= 0) && volume > 0) {
+              const srcTotal = parseNumber(row.total_amount);
+              if (Number.isFinite(srcTotal)) {
+                const srcRate = srcTotal / volume;
+                if (markup.markup_type === "percent") {
+                  const pct = Number(markup.markup_value) || 0;
+                  base = pct === -100 ? null : srcRate / (1 + (pct / 100));
+                } else {
+                  base = srcRate - (Number(markup.markup_value) || 0);
+                }
+              }
+            }
+            if (!Number.isFinite(base) || base <= 0) {
+              flags.push("RATE_MISSING");
+            }
+          }
+
+          if (flags.length === 0) {
             if (markup.markup_type === "percent") {
-              finalRate = round4(base * (1 + (Number(markup.markup_value) || 0) / 100));
+              const baseWithMarkup = base * (1 + (Number(markup.markup_value) || 0) / 100);
+              finalRate = round4(baseWithMarkup + (isDslLs ? (fetPerLtr + pftPerLtr) : 0));
             } else {
-              finalRate = round4(base + (Number(markup.markup_value) || 0));
+              finalRate = round4(
+                base +
+                (isDslLs ? (fetPerLtr + pftPerLtr) : 0) +
+                (Number(markup.markup_value) || 0)
+              );
             }
 
             subtotal = round4(volume * (finalRate || 0));
