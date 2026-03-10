@@ -400,6 +400,8 @@ const ensureInvoiceBatchPhase2Schema = async () => {
       ADD COLUMN IF NOT EXISTS rate_group_name TEXT,
       ADD COLUMN IF NOT EXISTS rate_source_effective_date DATE,
       ADD COLUMN IF NOT EXISTS base_rate NUMERIC(12,6),
+      ADD COLUMN IF NOT EXISTS fet NUMERIC(12,6),
+      ADD COLUMN IF NOT EXISTS pft NUMERIC(12,6),
       ADD COLUMN IF NOT EXISTS markup_rule_id BIGINT,
       ADD COLUMN IF NOT EXISTS markup_rule_used TEXT,
       ADD COLUMN IF NOT EXISTS markup_type TEXT,
@@ -589,13 +591,8 @@ const getBaseRateForTx = async (client, { txDate, location, province }) => {
      WHERE COALESCE(rf.customer_id, 0) = 0
        AND rf.effective_date <= $1::date
        AND COALESCE(rl.base_price, 0) > 0
-       AND (
-         regexp_replace(lower(COALESCE(rl.site_name,'')), '[^a-z0-9]+', '', 'g') =
-         regexp_replace(lower(COALESCE($2,'')), '[^a-z0-9]+', '', 'g')
-         OR (
-           COALESCE($3,'') <> '' AND upper(COALESCE(rl.province,'')) = upper($3)
-         )
-       )
+       AND regexp_replace(lower(COALESCE(rl.site_name,'')), '[^a-z0-9]+', '', 'g') =
+           regexp_replace(lower(COALESCE($2,'')), '[^a-z0-9]+', '', 'g')
      ORDER BY rf.effective_date DESC, rl.id DESC
      LIMIT 1`,
     [txDate, location, province]
@@ -5195,12 +5192,14 @@ router.get("/invoice-batches/:id", authMiddleware, async (req, res) => {
          t.product,
          t.volume_liters,
          COALESCE(
+           ${ibtCol("fet")},
            ${txCol("fet")},
            NULLIF(t.source_raw_json->>'fet', '')::numeric,
            NULLIF(t.source_raw_json->>'fet_per_liter', '')::numeric,
            0
          ) AS fet,
          COALESCE(
+           ${ibtCol("pft")},
            ${txCol("pft")},
            NULLIF(t.source_raw_json->>'pft', '')::numeric,
            NULLIF(t.source_raw_json->>'pft_per_liter', '')::numeric,
@@ -5519,17 +5518,19 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
            rate_group_name = $5,
            rate_source_effective_date = $6,
            base_rate = $7,
-           markup_rule_id = $8,
-           markup_rule_used = $9,
-           markup_type = $10,
-           markup_value = $11,
-           rate_per_ltr = $12,
-           subtotal = $13,
-           gst = $14,
-           pst = $15,
-           qst = $16,
-           amount_total = $17,
-           flags = $18,
+           fet = $8,
+           pft = $9,
+           markup_rule_id = $10,
+           markup_rule_used = $11,
+           markup_type = $12,
+           markup_value = $13,
+           rate_per_ltr = $14,
+           subtotal = $15,
+           gst = $16,
+           pst = $17,
+           qst = $18,
+           amount_total = $19,
+           flags = $20,
            markup_checked = false
          WHERE id = $1`,
         [
@@ -5540,6 +5541,8 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
           rateGroup?.rate_group_name || null,
           effectiveDate,
           Number.isFinite(base) ? round4(base) : (baseRate?.base_price || null),
+          Number.isFinite(fetPerLtr) ? round4(fetPerLtr) : 0,
+          Number.isFinite(pftPerLtr) ? round4(pftPerLtr) : 0,
           markup?.markup_rule_id || null,
           markup?.markup_rule_used || null,
           markup?.markup_type || null,
