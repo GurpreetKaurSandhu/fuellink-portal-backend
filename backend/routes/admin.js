@@ -5490,15 +5490,36 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
               const srcPst = parseNumber(raw.pst);
               const srcQst = parseNumber(raw.qst);
               const srcTotal = parseNumber(raw.amount) ?? parseNumber(row.total_amount);
-              if (Number.isFinite(srcRate)) finalRate = round4(srcRate);
-              if (Number.isFinite(srcSubtotal)) subtotal = round4(srcSubtotal);
-              if (Number.isFinite(srcGst)) gst = round4(srcGst); else gst = 0;
-              if (Number.isFinite(srcPst)) pst = round4(srcPst); else pst = 0;
-              if (Number.isFinite(srcQst)) qst = round4(srcQst); else qst = 0;
+
+              gst = Number.isFinite(srcGst) ? round4(srcGst) : 0;
+              pst = Number.isFinite(srcPst) ? round4(srcPst) : 0;
+              qst = Number.isFinite(srcQst) ? round4(srcQst) : 0;
+
+              if (Number.isFinite(srcSubtotal)) {
+                subtotal = round4(srcSubtotal);
+              } else if (Number.isFinite(srcTotal)) {
+                subtotal = round4((srcTotal || 0) - (gst || 0) - (pst || 0) - (qst || 0));
+              }
+
+              if (Number.isFinite(srcRate)) {
+                finalRate = round4(srcRate);
+              } else if (Number.isFinite(subtotal) && volume > 0) {
+                finalRate = round4(subtotal / volume);
+              } else if (Number.isFinite(srcTotal) && volume > 0) {
+                finalRate = round4(srcTotal / volume);
+              }
+
               if (Number.isFinite(srcTotal)) {
                 total = round4(srcTotal);
               } else if (Number.isFinite(subtotal)) {
                 total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
+              }
+
+              if (!Number.isFinite(base)) {
+                base = parseNumber(raw.base_rate) ?? parseNumber(raw.ex_tax);
+              }
+              if (!Number.isFinite(base) && Number.isFinite(finalRate)) {
+                base = finalRate;
               }
             } else {
               if (markup.markup_type === "percent") {
@@ -5563,7 +5584,7 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
           rateGroup?.rate_group_id || null,
           rateGroup?.rate_group_name || null,
           effectiveDate,
-          baseRate?.base_price || null,
+          Number.isFinite(base) ? round4(base) : (baseRate?.base_price || null),
           markup?.markup_rule_id || null,
           markup?.markup_rule_used || null,
           markup?.markup_type || null,
