@@ -5440,51 +5440,6 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
             }
             if ((!Number.isFinite(base) || base <= 0) && volume > 0) {
               const srcRate = parseNumber(raw.rate_per_ltr) ?? parseNumber(raw.rate_per_liter);
-              if (Number.isFinite(srcRate)) {
-                if (markup.markup_type === "percent") {
-                  const pct = Number(markup.markup_value) || 0;
-                  base = pct === -100 ? null : srcRate / (1 + (pct / 100));
-                } else {
-                  base = srcRate - (Number(markup.markup_value) || 0);
-                }
-              }
-            }
-            if ((!Number.isFinite(base) || base <= 0) && volume > 0) {
-              const srcSubtotal = parseNumber(raw.subtotal);
-              if (Number.isFinite(srcSubtotal)) {
-                const srcRate = srcSubtotal / volume;
-                if (markup.markup_type === "percent") {
-                  const pct = Number(markup.markup_value) || 0;
-                  base = pct === -100 ? null : srcRate / (1 + (pct / 100));
-                } else {
-                  base = srcRate - (Number(markup.markup_value) || 0);
-                }
-              }
-            }
-            if ((!Number.isFinite(base) || base <= 0) && volume > 0) {
-              const srcTotal = parseNumber(row.total_amount);
-              if (Number.isFinite(srcTotal)) {
-                const srcRate = srcTotal / volume;
-                if (markup.markup_type === "percent") {
-                  const pct = Number(markup.markup_value) || 0;
-                  base = pct === -100 ? null : srcRate / (1 + (pct / 100));
-                } else {
-                  base = srcRate - (Number(markup.markup_value) || 0);
-                }
-              }
-            }
-            if (!Number.isFinite(base) || base <= 0) {
-              flags.push("RATE_MISSING");
-            }
-          }
-
-          if (flags.length === 0) {
-            const raw = row?.source_raw_json && typeof row.source_raw_json === "object"
-              ? row.source_raw_json
-              : {};
-            // Keep non-DSL rows aligned with uploaded values for cross-checking.
-            if (!isDslLs) {
-              const srcRate = parseNumber(raw.rate_per_ltr) ?? parseNumber(raw.rate_per_liter);
               const srcSubtotal = parseNumber(raw.subtotal);
               const srcGst = parseNumber(raw.gst_hst) ?? parseNumber(raw.gst);
               const srcPst = parseNumber(raw.pst);
@@ -5514,6 +5469,14 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
               } else if (Number.isFinite(subtotal)) {
                 total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
               }
+
+              if (!Number.isFinite(base)) {
+                base = parseNumber(raw.base_rate) ?? parseNumber(raw.ex_tax);
+              }
+              if (!Number.isFinite(base) && Number.isFinite(finalRate)) {
+                base = finalRate;
+              }
+            }
 
               if (!Number.isFinite(base)) {
                 base = parseNumber(raw.base_rate) ?? parseNumber(raw.ex_tax);
