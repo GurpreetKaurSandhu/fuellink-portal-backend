@@ -5374,6 +5374,8 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
       let qst = null;
       let total = null;
       let effectiveDate = null;
+      let fetPerLtr = 0;
+      let pftPerLtr = 0;
 
       try {
         if (!row.customer_id || !txDate) {
