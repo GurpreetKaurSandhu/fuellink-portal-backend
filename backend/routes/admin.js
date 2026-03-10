@@ -5425,20 +5425,13 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
 
           let fetPerLtr = 0;
           let pftPerLtr = 0;
-          if (flags.length === 0 && isDslLs) {
-            base = Number(baseRate?.base_price);
+
+          if (flags.length === 0) {
             const raw = row?.source_raw_json && typeof row.source_raw_json === "object"
               ? row.source_raw_json
               : {};
-            fetPerLtr = parseNumber(raw.fet) ?? parseNumber(raw.fet_per_liter) ?? 0;
-            pftPerLtr = parseNumber(raw.pft) ?? parseNumber(raw.pft_per_liter) ?? 0;
-            if (!Number.isFinite(base) || base <= 0) {
-              base = parseNumber(raw.base_rate);
-            }
-            if (!Number.isFinite(base) || base <= 0) {
-              base = parseNumber(raw.ex_tax);
-            }
-            if ((!Number.isFinite(base) || base <= 0) && volume > 0) {
+
+            if (!isDslLs) {
               const srcRate = parseNumber(raw.rate_per_ltr) ?? parseNumber(raw.rate_per_liter);
               const srcSubtotal = parseNumber(raw.subtotal);
               const srcGst = parseNumber(raw.gst_hst) ?? parseNumber(raw.gst);
@@ -5470,27 +5463,32 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
                 total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
               }
 
-              if (!Number.isFinite(base)) {
-                base = parseNumber(raw.base_rate) ?? parseNumber(raw.ex_tax);
-              }
+              base = parseNumber(raw.base_rate) ?? parseNumber(raw.ex_tax);
               if (!Number.isFinite(base) && Number.isFinite(finalRate)) {
                 base = finalRate;
               }
-            }
-
             } else {
-              if (markup.markup_type === "percent") {
+              base = Number(baseRate?.base_price);
+              fetPerLtr = parseNumber(raw.fet) ?? parseNumber(raw.fet_per_liter) ?? 0;
+              pftPerLtr = parseNumber(raw.pft) ?? parseNumber(raw.pft_per_liter) ?? 0;
+
+              if (!Number.isFinite(base) || base <= 0) {
+                flags.push("RATE_MISSING");
+              } else if (markup.markup_type === "percent") {
                 const baseWithMarkup = base * (1 + (Number(markup.markup_value) || 0) / 100);
-                finalRate = round4(baseWithMarkup + (fetPerLtr + pftPerLtr));
+                finalRate = round4(baseWithMarkup + fetPerLtr + pftPerLtr);
               } else {
                 finalRate = round4(base + fetPerLtr + pftPerLtr + (Number(markup.markup_value) || 0));
               }
-              subtotal = round4(volume * (finalRate || 0));
-              const taxes = await getTaxRatesForTx(client, row.province, row.purchase_datetime || txDate);
-              gst = round4((subtotal || 0) * (Number(taxes.gst_rate) || 0));
-              pst = round4((subtotal || 0) * (Number(taxes.pst_rate) || 0));
-              qst = round4((subtotal || 0) * (Number(taxes.qst_rate) || 0));
-              total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
+
+              if (!flags.includes("RATE_MISSING")) {
+                subtotal = round4(volume * (finalRate || 0));
+                const taxes = await getTaxRatesForTx(client, row.province, row.purchase_datetime || txDate);
+                gst = round4((subtotal || 0) * (Number(taxes.gst_rate) || 0));
+                pst = round4((subtotal || 0) * (Number(taxes.pst_rate) || 0));
+                qst = round4((subtotal || 0) * (Number(taxes.qst_rate) || 0));
+                total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
+              }
             }
           }
         }
