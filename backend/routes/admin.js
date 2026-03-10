@@ -5422,9 +5422,6 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
             };
           }
 
-          let fetPerLtr = 0;
-          let pftPerLtr = 0;
-
           if (flags.length === 0) {
             const raw = row?.source_raw_json && typeof row.source_raw_json === "object"
               ? row.source_raw_json
