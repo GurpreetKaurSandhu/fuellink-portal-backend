@@ -583,7 +583,7 @@ const findBestMarkupRule = async (client, { customerId, product, province, locat
 
 const getBaseRateForTx = async (client, { txDate, location, province }) => {
   const result = await client.query(
-    `SELECT rl.base_price, rf.effective_date
+    `SELECT rl.base_price, rl.fet_per_liter, rl.pft_per_liter, rf.effective_date
      FROM rates_lines rl
      JOIN rates_files rf ON rf.id = rl.rates_file_id
      WHERE COALESCE(rf.customer_id, 0) = 0
@@ -5469,8 +5469,8 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
               }
             } else {
               base = Number(baseRate?.base_price);
-              fetPerLtr = parseNumber(raw.fet) ?? parseNumber(raw.fet_per_liter) ?? 0;
-              pftPerLtr = parseNumber(raw.pft) ?? parseNumber(raw.pft_per_liter) ?? 0;
+              fetPerLtr = parseNumber(baseRate?.fet_per_liter) ?? 0;
+              pftPerLtr = parseNumber(baseRate?.pft_per_liter) ?? 0;
 
               if (!Number.isFinite(base) || base <= 0) {
                 flags.push("RATE_MISSING");
@@ -5485,8 +5485,8 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
                 subtotal = round4(volume * (finalRate || 0));
                 const taxes = await getTaxRatesForTx(client, row.province, row.purchase_datetime || txDate);
                 gst = round4((subtotal || 0) * (Number(taxes.gst_rate) || 0));
-                pst = round4((subtotal || 0) * (Number(taxes.pst_rate) || 0));
-                qst = round4((subtotal || 0) * (Number(taxes.qst_rate) || 0));
+                pst = 0;
+                qst = 0;
                 total = round4((subtotal || 0) + (gst || 0) + (pst || 0) + (qst || 0));
               }
             }
