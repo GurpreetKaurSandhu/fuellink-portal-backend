@@ -5478,12 +5478,6 @@ router.post("/invoice-batches/:id/recalculate", authMiddleware, async (req, res)
               }
             }
 
-              if (!Number.isFinite(base)) {
-                base = parseNumber(raw.base_rate) ?? parseNumber(raw.ex_tax);
-              }
-              if (!Number.isFinite(base) && Number.isFinite(finalRate)) {
-                base = finalRate;
-              }
             } else {
               if (markup.markup_type === "percent") {
                 const baseWithMarkup = base * (1 + (Number(markup.markup_value) || 0) / 100);
